@@ -1,6 +1,4 @@
-import numpy as np
 import datajoint as dj
-
 
 from neuro_data.static_images.data_schemas import StaticScanCandidate, StaticScan, ConditionTier, Frame, InputResponse, Eye, Treadmill, StaticMultiDataset, StaticMultiDatasetGroupAssignment, ExcludedTrial
 
@@ -63,14 +61,14 @@ class NeuroDataPipelineManagement():
         print('Running preprocessing checks for ', target_scan)
 
         # Check if the scan has been processed completely
-        if pipeline_fuse.ScanDone() & target_scan:
+        if not pipeline_fuse.ScanDone() & target_scan:
             print('[Preprocessing Check]: ' + str(target_scan) + ' Scan has not been processed yet, please look into pipeline for details')
             return
         else:
             print('[Preprocessing Check]: ScanDone Check Passed')
 
         # Check if neurons area are labeled
-        if pipeline_anatomy.AreaMembership() & target_scan:
+        if not pipeline_anatomy.AreaMembership() & target_scan:
             print('[Preprocessing Check]: ' + str(target_scan) + " AreaMembership is not populated")
             user_input = None
             while user_input not in ['y', 'n']:
@@ -91,7 +89,7 @@ class NeuroDataPipelineManagement():
             print('[Preprocessing Check]: AreaMembership Check Passed')
 
         # Check if neuron layers are labeled
-        if pipeline_anatomy.LayerMembership() & target_scan:
+        if not pipeline_anatomy.LayerMembership() & target_scan:
             print('[Preprocessing Check]: ' + str(target_scan) + " LayerMembership is not populated")
 
             user_input = None
@@ -114,7 +112,7 @@ class NeuroDataPipelineManagement():
             print('[Preprocessing Check]: LayerMembership Check Passed')
 
         # Check pipeline_stimulus.Sync() table
-        if pipeline_stimulus.Sync() & target_scan:
+        if not pipeline_stimulus.Sync() & target_scan:
             print('[Preprocessing Check]: ' + str(target_scan) + ' pipeline_stimulus.Sync() table is not processed or failed to processed')
             return
         else:
@@ -127,7 +125,7 @@ class NeuroDataPipelineManagement():
         target_scan_done_key = (pipeline_fuse.ScanDone() & target_scan).fetch1('KEY')
 
         # Insert into StaticScanCandidate
-        if StaticScanCandidate & target_scan_done_key:
+        if not StaticScanCandidate & target_scan_done_key:
             StaticScanCandidate.insert1(target_scan_done_key)
             print('[NeuroData.Static Populate]: Successfully inserted Scan into StaticScanCandidate')
         else:
@@ -167,7 +165,7 @@ class NeuroDataPipelineManagement():
         # Insert Scan into StaticMultiDatasetGroupAssignment with whatever is the next highest_group_id
         print("[NeuroData.Static Populate]: Inserting Scan into StaticMultiDatasetGroupAssignment with next largest group_id:")
         target_input_response_key = (InputResponse & target_scan & dict(preproc_id=0)).fetch1('KEY')
-        if StaticMultiDatasetGroupAssignment & target_input_response_key:
+        if not StaticMultiDatasetGroupAssignment & target_input_response_key:
             target_input_response_key['group_id'] = StaticMultiDatasetGroupAssignment().fetch('group_id').max() + 1
             target_input_response_key['description'] = 'Inserted from PipelineManagement'
             StaticMultiDatasetGroupAssignment.insert1(target_input_response_key)
