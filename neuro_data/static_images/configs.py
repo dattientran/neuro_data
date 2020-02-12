@@ -431,7 +431,7 @@ class DataConfig(ConfigBase, dj.Lookup):
                              [True],
                              [True, False],
                              ['L4', 'L2/3'],
-                             ['V1', 'LM']):
+                             ['V1', 'LM', 'RL', 'AL']):
                 yield dict(zip(self.heading.dependent_attributes, p))
 
 
