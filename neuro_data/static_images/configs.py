@@ -18,12 +18,10 @@ from tqdm import tqdm
 from os import path
 
 
-
-
-
-
 experiment = dj.create_virtual_module('experiment', 'pipeline_experiment')
 anatomy = dj.create_virtual_module('anatomy', 'pipeline_anatomy')
+meso = dj.create_virtual_module('meso', 'pipeline_meso')
+loop = dj.create_virtual_module('loop', 'neurostatic_zhiwei_loop')
 
 schema = dj.schema('neurodata_static_configs')
 
@@ -51,6 +49,77 @@ try:
 except:
     pass
 
+
+@schema
+class CellMatchParameters(dj.Lookup):
+    definition = """
+    match_params:      int  
+    ---
+    oraclecorr_thre:   float       # any matched pairs with less than this correlation to oracle images will be discarded
+    distance_thre:      float       # any matched pairs with larger than this distance will be discarded
+    edge_thresh:        float       # any cell whose centroid is < number of microns to the edge will be discarded (<=0 to not discard)
+    oracle_thresh:     float        # any cells with less than this oracle will be discarded
+    cnnperf_thresh:    float        # any cells with less than this cnn performance will be discarded
+    """
+    contents = [(1, 0.6, 15, 0, -1, -1)]
+    
+    
+@schema
+class MultipleDatasets(dj.Computed):
+    definition = """
+    -> StaticMultiDataset
+    -> CellMatchParameters
+    -> loop.LoopGroup
+    """
+    
+    @property
+    def key_source(self):
+        return loop.LoopGroup * StaticMultiDataset * CellMatchParameters & 'loop_group = 4 and group_id = 134 and match_params = 1'
+    
+    class MatchedCells(dj.Part):
+        definition = """ # Matched cells (in the same order) in each member scan of the multi dataset
+        -> master
+        -> StaticMultiDataset.Member
+        ---
+        name:            varchar(50)   # string description of the member scan to be used for training
+        matched_cells:   longblob      # array of matched cells in each member scan of the group, unit_ids at the same indices for each member scan represent the matched cells
+        """
+    
+    def make(self, key):
+        src_rel = loop.ClosedLoopScan * (StaticMultiDataset.Member & key) & 'mei_source = 1'
+        src_key = src_rel.proj('name').fetch1()
+        # For now only deals with one target scan
+        target_key = (loop.ClosedLoopScan * (StaticMultiDataset.Member & key) & 'mei_source = 0' & {'loop_group': src_key['loop_group']}).proj('name').fetch1()
+        
+        # Get oracle correlation matrix
+        src_units, corr = (loop.CellMatchOracleCorrelation & target_key).fetch1('units', 'corr_matrix')
+
+        # Get unit ids within V1 ROI
+        v1roi = (dj.U('field') & (anatomy.AreaMask() & src_rel & 'brain_area = "V1"')) - (dj.U('field') & (anatomy.AreaMask() & src_rel & 'brain_area = "PM"'))
+        src_unit_ids, target_unit_ids, distance = (loop.TempBestProximityCellMatch2 & target_key & (meso.ScanSet.Unit() & src_rel & v1roi).proj(src_session='session', src_scan_idx='scan_idx', src_unit_id='unit_id')).fetch('src_unit_id', 'unit_id', 'mean_distance', order_by='src_unit_id')
+        idx = np.array([np.argwhere(src_units == u).item() for u in src_unit_ids])
+        diag = np.diag(corr)[idx]
+
+        # Filter out matched pairs that do not satisfy thresholds on oracle correlation and max distance 
+        match_params = (CellMatchParameters & key).fetch1()
+        oraclecorr_thre = match_params['oraclecorr_thre']
+        distance_thre = match_params['distance_thre']
+        valid_src_unit_ids = src_unit_ids[(diag > oraclecorr_thre) & (distance < distance_thre)]
+        valid_target_unit_ids = target_unit_ids[(diag > oraclecorr_thre) & (distance < distance_thre)]
+        valid_corr = diag[(diag > oraclecorr_thre) & (distance < distance_thre)]
+        valid_distance = distance[(diag > oraclecorr_thre) & (distance < distance_thre)]
+
+        # Iteratively take the most correlated pairs for units matched to the same target unit
+        keep_src_units = []
+        keep_target_units = []
+        for src, target, corr in sorted(zip(valid_src_unit_ids, valid_target_unit_ids, valid_corr), key=lambda x: x[-1], reverse=True):
+            if target not in keep_target_units:
+                keep_src_units.append(src)
+                keep_target_units.append(target)
+                
+        self.insert1(key)
+        self.MatchedCells.insert1({**src_key, 'match_params': key['match_params'], 'matched_cells': keep_src_units})
+        self.MatchedCells.insert1({**target_key, 'match_params': key['match_params'], 'matched_cells': keep_target_units})
 
 
 class BackwardCompatibilityMixin:
@@ -131,7 +200,7 @@ class StimulusTypeMixin:
             A subclass of Sampler
 
         """
-        assert tier in ['train', 'validation', 'test', None]
+        assert tier in ['train', 'validation', 'test', 'test_masked', None] 
         if tier == 'train':
             if not balanced:
                 Sampler = SubsetRandomSampler
@@ -299,6 +368,50 @@ class AreaLayerModelMixin:
                         t.exclude.append('responses')
 
         return datasets, loaders
+    
+class AreaLayerMatchedCellMixin(StimulusTypeMixin):
+    def load_data(self, key, tier=None, batch_size=1, key_order=None, stimulus_types=None, Sampler=None, **kwargs):
+        log.info('Ignoring input arguments: "' +
+                 '", "'.join(kwargs.keys()) + '"' + 'when creating datasets')
+        exclude = key.pop('exclude').split(',')
+        stimulus_types = key.pop('stimulus_type')
+        datasets, loaders = super().load_data(key, tier, batch_size, key_order,
+                                              exclude_from_normalization=exclude,
+                                              stimulus_types=stimulus_types,
+                                              Sampler=Sampler)
+        len_idx = []
+        for readout_key, dataset in datasets.items():
+            
+            # subsample based on layer and area restrictions
+            log.info('Subsampling to layer {} and area(s) "{}"'.format(key['layer'],
+                                                                   key.get('brain_area') or key['brain_areas']))
+            layers = dataset.neurons.layer
+            areas = dataset.neurons.area
+
+            layer_idx = (layers == key['layer'])
+            desired_areas = ([key['brain_area'], ] if 'brain_area' in key else
+                             (common_configs.BrainAreas.BrainArea & key).fetch('brain_area'))
+            area_idx = np.stack([areas == da for da in desired_areas]).any(axis=0)
+            idx = np.where(layer_idx & area_idx)[0]
+            
+            # subsample based on matched unit ids in each member scan
+            log.info('Subsampling to matched cells in scan {} in group {}'.format(readout_key, key['group_id']))
+
+            units = dataset.neurons.unit_ids[idx]
+            desired_units = (MultipleDatasets.MatchedCells() & {'name': readout_key}).fetch1('matched_cells')
+            unit_idx = np.array([np.argwhere(units == u).item() for u in desired_units])
+            len_idx.append(len(unit_idx))
+          
+            if len(unit_idx) == 0:
+                log.warning('Empty set of neurons. Deleting this key')
+                del datasets[readout_key]
+                del loaders[readout_key]
+            else:
+                dataset.transforms.insert(-1, Subsample(idx[unit_idx]))
+
+        assert (all(ele == len_idx[0] for ele in len_idx)), 'Numbers of subsampled units in each member scan are not equal'
+
+        return datasets, loaders
 
 class AreaLayerNoiseMixin(AreaLayerRawMixin):
     def load_data(self, key, balanced=False, **kwargs):
@@ -398,6 +511,34 @@ class DataConfig(ConfigBase, dj.Lookup):
         return datasets, loaders
 
     class CorrectedAreaLayer(dj.Part, AreaLayerRawMixin):
+        definition = """
+        -> master
+        ---
+        stats_source            : varchar(50)   # normalization source
+        stimulus_type           : varchar(50)   # type of stimulus
+        exclude                 : varchar(512)  # what inputs to exclude from normalization
+        normalize               : bool          # whether to use a normalizer or not
+        normalize_per_image     : bool          # whether to normalize each input separately
+        -> experiment.Layer
+        -> anatomy.Area
+        """
+
+        def describe(self, key):
+            return "{brain_area} {layer} on {stimulus_type}. normalize={normalize} on {stats_source} (except '{exclude}')".format(
+                **key)
+
+        @property
+        def content(self):
+            for p in product(['all'],
+                             ['stimulus.Frame', '~stimulus.Frame', 'stimulus.ColorFrameProjector'],
+                             ['images,responses', ''],
+                             [True],
+                             [True, False],
+                             ['L4', 'L2/3'],
+                             ['V1', 'LM', 'RL', 'AL']):
+                yield dict(zip(self.heading.dependent_attributes, p))
+                
+    class CorrectedAreaLayerMatchedCell(dj.Part, AreaLayerMatchedCellMixin):
         definition = """
         -> master
         ---
