@@ -74,7 +74,7 @@ class MultipleDatasets(dj.Computed):
     
     @property
     def key_source(self):
-        return loop.LoopGroup * StaticMultiDataset * CellMatchParameters & 'loop_group = 4 and group_id = 134 and match_params = 1'
+        return loop.LoopGroup * StaticMultiDataset * CellMatchParameters & 'loop_group = 3 and group_id = 136 and match_params = 1'
     
     class MatchedCells(dj.Part):
         definition = """ # Matched cells (in the same order) in each member scan of the multi dataset
@@ -95,10 +95,15 @@ class MultipleDatasets(dj.Computed):
         src_units, corr = (loop.CellMatchOracleCorrelation & target_key).fetch1('units', 'corr_matrix')
 
         # Get unit ids within V1 ROI
-        v1roi = (dj.U('field') & (anatomy.AreaMask() & src_rel & 'brain_area = "V1"')) - (dj.U('field') & (anatomy.AreaMask() & src_rel & 'brain_area = "PM"'))
-        src_unit_ids, target_unit_ids, distance = (loop.TempBestProximityCellMatch2 & target_key & (meso.ScanSet.Unit() & src_rel & v1roi).proj(src_session='session', src_scan_idx='scan_idx', src_unit_id='unit_id')).fetch('src_unit_id', 'unit_id', 'mean_distance', order_by='src_unit_id')
+        if len(dj.U('brain_area') & (anatomy.AreaMembership & src_key)) > 1:
+            v1roi = (dj.U('field') & (anatomy.AreaMask() & src_rel & 'brain_area = "V1"')) - (dj.U('field') & (anatomy.AreaMask() & src_rel & 'brain_area = "PM"'))
+            src_unit_ids, target_unit_ids, distance = (loop.TempBestProximityCellMatch2 & target_key & (meso.ScanSet.Unit & src_rel & v1roi).proj(src_session='session', src_scan_idx='scan_idx', src_unit_id='unit_id')).fetch('src_unit_id', 'unit_id', 'mean_distance', order_by='src_unit_id')
+        else:
+            src_unit_ids, target_unit_ids, distance = (loop.TempBestProximityCellMatch2 & target_key & (meso.ScanSet.Unit & src_rel).proj(src_session='session', src_scan_idx='scan_idx', src_unit_id='unit_id')).fetch('src_unit_id', 'unit_id', 'mean_distance', order_by='src_unit_id')
+            
         idx = np.array([np.argwhere(src_units == u).item() for u in src_unit_ids])
         diag = np.diag(corr)[idx]
+            
 
         # Filter out matched pairs that do not satisfy thresholds on oracle correlation and max distance 
         match_params = (CellMatchParameters & key).fetch1()
@@ -398,7 +403,12 @@ class AreaLayerMatchedCellMixin(StimulusTypeMixin):
             log.info('Subsampling to matched cells in scan {} in group {}'.format(readout_key, key['group_id']))
 
             units = dataset.neurons.unit_ids[idx]
-            desired_units = (MultipleDatasets.MatchedCells() & {'name': readout_key}).fetch1('matched_cells')
+            if len(MultipleDatasets.MatchedCells() & {'name': readout_key}) > 0:    # when combining datasets
+                desired_units = (MultipleDatasets.MatchedCells() & {'name': readout_key}).fetch1('matched_cells')
+            else:    # hack: when only use matched cells from one dataset (as a control to compare model performance)
+                animal, session, scan = (StaticMultiDataset.Member & key).fetch1('animal_id', 'session', 'scan_idx')
+                desired_units = (MultipleDatasets.MatchedCells & {'animal_id': animal, 'session': session, 'scan_idx': scan}).fetch1('matched_cells')
+
             unit_idx = np.array([np.argwhere(units == u).item() for u in desired_units])
             len_idx.append(len(unit_idx))
           
