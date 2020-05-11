@@ -74,8 +74,7 @@ class MultipleDatasets(dj.Computed):
     
     @property
     def key_source(self):
-        return loop.LoopGroup * StaticMultiDataset * CellMatchParameters & 'loop_group = 3 and group_id = 136 and match_params = 1'
-    
+        return loop.LoopGroup * StaticMultiDataset * CellMatchParameters & 'match_params = 1' # need to restrict by loop_group and group_id
     class MatchedCells(dj.Part):
         definition = """ # Matched cells (in the same order) in each member scan of the multi dataset
         -> master
@@ -468,6 +467,181 @@ class AreaLayerNoiseMixin(AreaLayerRawMixin):
                 self.log_loader(loaders[k])
         return datasets, loaders
 
+class ToyStimulusTypeMixin:
+    _stimulus_type = None
+
+    @staticmethod
+    def add_transforms(key, datasets, exclude=None):
+        if exclude is not None:
+            log.info('Excluding "{}" from normalization'.format(
+                '", "'.join(exclude)))
+        for k, dataset in datasets.items():
+            transforms = []
+
+            if key.get('normalize', True):
+                transforms.append(Normalizer(
+                    dataset,
+                    stats_source=key.get('stats_source', 'all'),
+                    normalize_per_image=key.get('normalize_per_image', False),
+                    exclude=exclude))
+            transforms.append(ToTensor())
+            dataset.transforms = transforms
+
+        return datasets
+
+    @staticmethod
+    def get_constraint(dataset, stimulus_type, tier=None):
+        """
+        Find subentries of dataset that matches the given `stimulus_type` specification and `tier` specification.
+        `stimulus_type` is of the format `stimulus.Frame|~stimulus.Monet|...`. This function returns a boolean array
+        suitable to be used for boolean indexing to obtain only entries with data types and tiers matching the
+        specified condition.
+        """
+        constraint = np.zeros(len(dataset.types), dtype=bool)
+        for const in map(lambda s: s.strip(), stimulus_type.split('|')):
+            if const.startswith('~'):
+                log.info('Using all trial but from {}'.format(const[1:]))
+                tmp = (dataset.types != const[1:])
+            else:
+                log.info('Using all trial from {}'.format(const))
+                tmp = (dataset.types == const)
+            constraint = constraint | tmp
+        if tier is not None:
+            constraint = constraint & (dataset.tiers == tier)
+        return constraint
+
+    @staticmethod
+    def get_sampler_class(tier, balanced=False):
+        """
+        Given data `tier` return a default Sampler class suitable for that tier. If `tier="train"` and `balanced=True`,
+        returns BalancedSubsetSampler
+        Args:
+            tier: dataset tier - 'train', 'validation', 'test', or None
+            balanced: if True and tier='train', returns balanced version
+
+        Returns:
+            A subclass of Sampler
+
+        """
+        assert tier in ['train', 'validation', 'test', 'test_masked', None] 
+        if tier == 'train':
+            if not balanced:
+                Sampler = SubsetRandomSampler
+            else:
+                Sampler = BalancedSubsetSampler
+        else:
+            Sampler = SubsetSequentialSampler
+        return Sampler
+
+    @staticmethod
+    def log_loader(loader):
+        """
+        A helper function that when given an instance of DataLoader, print out a log detailing its configuration
+        """
+        log.info('Loader sampler is {}'.format(
+            loader.sampler.__class__.__name__))
+        log.info('Number of samples in the loader will be {}'.format(
+            len(loader.sampler)))
+        log.info(
+            'Number of batches in the loader will be {}'.format(int(np.ceil(len(loader.sampler) / loader.batch_size))))
+
+    def get_loaders(self, datasets, tier, batch_size, stimulus_types, Sampler):
+        """
+
+        Args:
+            datasets: a dictionary of H5ArrayDataSets
+            tier: tier of data to be loaded. Can be 'train', 'validation', 'test', or None
+            batch_size: size of a batch to be returned by the data loader
+            stimulus_types: stimulus type specification like 'stimulus.Frame|~stimulus.Monet'
+            Sampler: sampler to be placed on the data loader. If None, defaults to a sampler chosen based on the tier
+
+        Returns:
+            A dictionary of DataLoader's, key paired to each dataset
+        """
+
+        # if Sampler not given, use a default one specified for each tier
+        if Sampler is None:
+            Sampler = self.get_sampler_class(tier)
+
+        # if only a single stimulus_types string was given, apply to all datasets
+        if not isinstance(stimulus_types, list):
+            log.info('Using {} as stimulus type for all datasets'.format(
+                stimulus_types))
+            stimulus_types = len(datasets) * [stimulus_types]
+
+        log.info('Stimulus sources: "{}"'.format('","'.join(stimulus_types)))
+
+        loaders = OrderedDict()
+        constraints = [self.get_constraint(dataset, stimulus_type, tier=tier)
+                       for dataset, stimulus_type in zip(datasets.values(), stimulus_types)]
+
+        for (k, dataset), stimulus_type, constraint in zip(datasets.items(), stimulus_types, constraints):
+            log.info('Selecting trials from {} and tier={} for dataset {}'.format(
+                stimulus_type, tier, k))
+            ix = np.where(constraint)[0]
+            log.info('Found {} active trials'.format(constraint.sum()))
+            if Sampler is BalancedSubsetSampler:
+                sampler = Sampler(ix, dataset.types, mode='longest')
+            else:
+                sampler = Sampler(ix)
+            loaders[k] = DataLoader(
+                dataset, sampler=sampler, batch_size=batch_size)
+            self.log_loader(loaders[k])
+        return loaders
+
+    def load_data(self, key, tier=None, batch_size=1, key_order=None,
+                  exclude_from_normalization=None, stimulus_types=None, Sampler=None):
+        log.info('Loading {} dataset with tier={}'.format(
+            self._stimulus_type, tier))
+        from staticnet_invariance import active_learning
+        datasets = active_learning.MultiSessionDataset().fetch_data(key, key_order=key_order)
+        for k, dat in datasets.items():
+            if 'stats_source' in key:
+                log.info(
+                    'Adding stats_source "{stats_source}" to dataset'.format(**key))
+                dat.stats_source = key['stats_source']
+
+        log.info('Using statistics source ' + key['stats_source'])
+
+        datasets = self.add_transforms(
+            key, datasets, exclude=exclude_from_normalization)
+
+        loaders = self.get_loaders(
+            datasets, tier, batch_size, stimulus_types, Sampler)
+        return datasets, loaders
+    
+    
+class ToyAreaLayerRawMixin(ToyStimulusTypeMixin):
+    def load_data(self, key, tier=None, batch_size=1, key_order=None, stimulus_types=None, Sampler=None, **kwargs):
+        log.info('Ignoring input arguments: "' +
+                 '", "'.join(kwargs.keys()) + '"' + 'when creating datasets')
+        exclude = key.pop('exclude').split(',')
+        stimulus_types = key.pop('stimulus_type')
+        datasets, loaders = super().load_data(key, tier, batch_size, key_order,
+                                              exclude_from_normalization=exclude,
+                                              stimulus_types=stimulus_types,
+                                              Sampler=Sampler)
+
+        log.info('Subsampling to layer {} and area(s) "{}"'.format(key['layer'],
+                                                                   key.get('brain_area') or key['brain_areas']))
+        for readout_key, dataset in datasets.items():
+            layers = dataset.neurons.layer
+            areas = dataset.neurons.area
+
+            layer_idx = (layers == key['layer'])
+            desired_areas = ([key['brain_area'], ] if 'brain_area' in key else
+                             (common_configs.BrainAreas.BrainArea & key).fetch('brain_area'))
+            area_idx = np.stack([areas == da for da in desired_areas]).any(axis=0)
+            idx = np.where(layer_idx & area_idx)[0]
+            if len(idx) == 0:
+                log.warning('Empty set of neurons. Deleting this key')
+                del datasets[readout_key]
+                del loaders[readout_key]
+            else:
+                dataset.transforms.insert(-1, Subsample(idx))
+        return datasets, loaders
+    
+
 @schema
 class DataConfig(ConfigBase, dj.Lookup):
     _config_type = 'data'
@@ -542,7 +716,7 @@ class DataConfig(ConfigBase, dj.Lookup):
             for p in product(['all'],
                              ['stimulus.Frame', '~stimulus.Frame', 'stimulus.ColorFrameProjector'],
                              ['images,responses', ''],
-                             [True],
+                             [True, False],
                              [True, False],
                              ['L4', 'L2/3'],
                              ['V1', 'LM', 'RL', 'AL']):
@@ -574,6 +748,34 @@ class DataConfig(ConfigBase, dj.Lookup):
                              [True, False],
                              ['L4', 'L2/3'],
                              ['V1', 'LM', 'RL', 'AL']):
+                yield dict(zip(self.heading.dependent_attributes, p))
+                
+    class ToyCorrectedAreaLayer(dj.Part, ToyAreaLayerRawMixin):
+        definition = """
+        -> master
+        ---
+        stats_source            : varchar(50)   # normalization source
+        stimulus_type           : varchar(50)   # type of stimulus
+        exclude                 : varchar(512)  # what inputs to exclude from normalization
+        normalize               : bool          # whether to use a normalizer or not
+        normalize_per_image     : bool          # whether to normalize each input separately
+        -> experiment.Layer
+        -> anatomy.Area
+        """
+
+        def describe(self, key):
+            return "{brain_area} {layer} on {stimulus_type}. normalize={normalize} on {stats_source} (except '{exclude}')".format(
+                **key)
+
+        @property
+        def content(self):
+            for p in product(['all'],
+                             ['stimulus.Frame'],
+                             ['images,responses', ''],
+                             [True, False],
+                             [True, False],
+                             ['L2/3'],
+                             ['V1']):
                 yield dict(zip(self.heading.dependent_attributes, p))
 
     class ModeledAreaLayer(dj.Part, AreaLayerModelMixin):
