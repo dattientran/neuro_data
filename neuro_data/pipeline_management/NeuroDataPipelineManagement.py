@@ -2,7 +2,7 @@ import numpy as np
 import datajoint as dj
 
 
-from neuro_data.static_images.data_schemas import StaticScanCandidate, StaticScan, ImageNetSplit, ConditionTier, Frame, InputResponse, Eye, Treadmill, StaticMultiDataset, StaticMultiDatasetGroupAssignment, ExcludedTrial
+from neuro_data.static_images.data_schemas import StaticScanCandidate, StaticScan, TempImageNetSplit, ImageNetSplit, ConditionTier, Frame, InputResponse, Eye, Treadmill, StaticMultiDataset, StaticMultiDatasetGroupAssignment, ExcludedTrial
 
 pipeline_anatomy = dj.create_virtual_module('pipeline_anatomy', 'pipeline_anatomy')
 pipeline_fuse = dj.create_virtual_module('pipeline_fuse', 'pipeline_fuse')
@@ -117,48 +117,53 @@ class NeuroDataPipelineManagement():
                     elif user_input == 'n':
                         return
 
-            # Check pipeline_stimulus.Sync() table
-            if pipeline_stimulus.Sync() & target_scan:
-                print('[Preprocessing Check]: Sync Check Passed')
-            else:
-                print('[Preprocessing Check]: ' + str(target_scan) + ' pipeline_stimulus.Sync() table is not processed or failed to processed')
-                return
+#             # Check pipeline_stimulus.Sync() table
+#             if pipeline_stimulus.Sync() & target_scan:
+#                 print('[Preprocessing Check]: Sync Check Passed')
+#             else:
+#                 print('[Preprocessing Check]: ' + str(target_scan) + ' pipeline_stimulus.Sync() table is not processed or failed to processed')
+#                 return
 
-            # All tables requirements are met, begin neurodata dataset population
-            print('[Preprocessing Check]: All table requirements passed, beginning neuro_data populating:')
+#             # All tables requirements are met, begin neurodata dataset population
+#             print('[Preprocessing Check]: All table requirements passed, beginning neuro_data populating:')
             
             # Get the ScanDone primary key reference
+            #import pdb; pdb.set_trace()
             target_scan_done_key = (pipeline_fuse.ScanDone() & target_scan).fetch1('KEY')
 
-            # Insert into StaticScanCandidate
-            if StaticScanCandidate & target_scan_done_key:
-                print('[NeuroData.Static Populate]: Scan has already been added to StaticScanCandidate')
-            else:
-                StaticScanCandidate.insert1(target_scan_done_key)
-                print('[NeuroData.Static Populate]: Successfully inserted Scan into StaticScanCandidate')
+#             # Insert into StaticScanCandidate
+#             if StaticScanCandidate & target_scan_done_key:
+#                 print('[NeuroData.Static Populate]: Scan has already been added to StaticScanCandidate')
+#             else:
+#                 StaticScanCandidate.insert1(target_scan_done_key)
+#                 print('[NeuroData.Static Populate]: Successfully inserted Scan into StaticScanCandidate')
 
-            # Populating StaticScans
-            print("[NeuroData.Static Populate]: Populating StaticScan:")
-            StaticScan().populate(target_scan_done_key)
+#             # Populating StaticScans
+#             print("[NeuroData.Static Populate]: Populating StaticScan:")
+#             StaticScan().populate(target_scan_done_key)
 
-            # Populating ImageNetSplit
-            print("[NeuroData.Static Populate]: Populating ImageNetSplit:")
-            ImageNetSplit().fill(target_scan_done_key)
+#             # Populating TempImageNetSplit
+#             print("[NeuroData.Static Populate]: Populating TempImageNetSplit:")
+#             TempImageNetSplit().fill(target_scan_done_key)
 
-            # Populate ConditionTier
-            print("[NeuroData.Static Populate]: Populating ConditionTier:")
-            ConditionTier.populate(target_scan_done_key)
+# # #             # Populating ImageNetSplit
+# # #             print("[NeuroData.Static Populate]: Populating ImageNetSplit:")
+# # #             ImageNetSplit().fill(target_scan_done_key)
 
-            # Check for incorrect flip times
-            print("[NeuroData.Static Populate]: Checking for Incorrect Flip Times:")
-            trials = (pipeline_stimulus.Trial() & target_scan).proj('flip_times').fetch(as_dict=True)
-            for trial in trials:
-                if trial['flip_times'].shape[1] != 3: # correct number of flips, hardcoded
-                    ExcludedTrial.insert1(trial, ignore_extra_fields=True)
+#             # Populate ConditionTier
+#             print("[NeuroData.Static Populate]: Populating ConditionTier:")
+#             ConditionTier.populate(target_scan_done_key)
 
-            # Populate Frame
-            print("[NeuroData.Static Populate]: Populating Frame:")
-            Frame.populate(dict(preproc_id = 0))
+#             # Check for incorrect flip times
+#             print("[NeuroData.Static Populate]: Checking for Incorrect Flip Times:")
+#             trials = (pipeline_stimulus.Trial() & target_scan).proj('flip_times').fetch(as_dict=True)
+#             for trial in trials:
+#                 if trial['flip_times'].shape[1] != 3: # correct number of flips, hardcoded
+#                     ExcludedTrial.insert1(trial, ignore_extra_fields=True)
+
+#             # Populate Frame
+#             print("[NeuroData.Static Populate]: Populating Frame:")
+#             Frame.populate(dict(preproc_id = 0))
 
             # Populate InputResponse
             print("[NeuroData.Static Populate]: Populating InputResponse:")

@@ -22,6 +22,7 @@ stimulus = dj.create_virtual_module('stimulus', 'pipeline_stimulus')
 shared = dj.create_virtual_module('shared', 'pipeline_shared')
 anatomy = dj.create_virtual_module('anatomy', 'pipeline_anatomy')
 treadmill = dj.create_virtual_module('treadmill', 'pipeline_treadmill')
+base = dj.create_virtual_module('neurostatic_base', 'neurostatic_base')
 
 schema = dj.schema('neurodata_static')
 
@@ -33,8 +34,12 @@ UNIQUE_FRAME = {
     'stimulus.ColorFrameProjector': ('image_id', 'image_class'),
 }
 
-IMAGE_CLASSES = 'image_class in ("imagenet", "imagenet_v2_gray", "imagenet_v2_rgb")' # all valid natural image classes
-
+IMAGE_CLASSES = 'image_class in ("imagenet", "masked_oracle", "masked_single", "diverse_mei", "searched_nat", "mei2", "imagenet_v2_gray", "imagenet_v2_rgb")' # all valid natural image classes
+ORACLE_CLASSES = 'image_class in ("imagenet", "masked_oracle")'
+TRAINING_CLASSES = 'image_class in ("imagenet", "masked_single", "searched_nat", "diverse_mei", "mei2")'
+MASKED_CLASSES = ['diverse_mei', 'mei2', 'masked_single']
+FF_CLASSES = ['imagenet', 'searched_nat']
+    
 @schema
 class StaticScanCandidate(dj.Manual):
     definition = """ # list of scans to process
@@ -94,7 +99,7 @@ class Tier(dj.Lookup):
 
     @property
     def contents(self):
-        yield from zip(["train", "test", "validation"])
+        yield from zip(["train", "test", "test_masked", "validation"])
 
 
 @schema
@@ -139,7 +144,7 @@ class ImageNetSplit(dj.Lookup):
             frame_table = stimulus.ColorFrameProjector
         else:
             print('Static images were not shown for this scan')
-
+        
         # Get all image ids in this scan
         all_frames = frame_table * stimulus.Trial & scan_key & IMAGE_CLASSES
         unique_frames = dj.U('image_id', 'image_class').aggr(all_frames, repeats='COUNT(*)')
@@ -158,7 +163,7 @@ class ImageNetSplit(dj.Lookup):
 
         # Compute number of validation examples
         num_validation = int(np.ceil((num_frames - num_oracles) * 0.1))  # 10% validation examples
-
+        
         # Insert
         self.insert([{'image_id': iid, 'image_class': ic, 'tier': 'test'} for iid, ic in
                      zip(image_ids[:num_oracles], image_classes[:num_oracles])],
@@ -169,12 +174,123 @@ class ImageNetSplit(dj.Lookup):
         self.insert([{'image_id': iid, 'image_class': ic, 'tier': 'train'} for iid, ic in
                      zip(image_ids[num_oracles + num_validation:],
                          image_classes[num_oracles + num_validation:])])
+        
 
+@schema
+class TempImageNetSplit(dj.Lookup):
+    definition = """ # split imagenet frames into train, test, validation, and test_masked (if masked oracles are used)
+    -> StaticScan
+    ---
+    n_unique_images:    int  # total number of unique images in this scan
+    """
+    class Image(dj.Part):
+        definition = """ 
+        -> master
+        -> stimulus.StaticImage.Image
+        ---
+        -> Tier
+        """
+    def fill(self, scan_key):
+        """ Assign each imagenet frame in the current scan to train/test/validation set.
+
+        Arguments:
+            scan_key: An scan (animal_id, session, scan_idx) that has stimulus.Trials
+                created. Usually one where the stimulus was presented.
+
+        Note:
+            Each image is assigned to one set and that holds true for all our scans and
+            collections. Once an image has been assigned (and models have been trained
+            with that split), it cannot be changed in the future (this is problematic if
+            images are reused as those from collection 2 or collection 3 with a different
+            purpose).
+
+            The exact split assigned will depend on the scans used in fill and the order
+            that this table was filled. Not ideal.
+        """
+        
+        key = (StaticScan & scan_key).fetch1('KEY')
+        
+        # Find out whether we are using the old pipeline (grayscale only) or the new version
+        if stimulus.Frame & (stimulus.Trial & scan_key):
+            frame_table = stimulus.Frame
+        elif stimulus.ColorFrameProjector & (stimulus.Trial & scan_key):
+            frame_table = stimulus.ColorFrameProjector
+        else:
+            print('Static images were not shown for this scan')
+
+        # Get all image ids in this scan
+        all_frames = frame_table * stimulus.Trial & scan_key & IMAGE_CLASSES
+        unique_frames = dj.U('image_id', 'image_class').aggr(all_frames, repeats='COUNT(*)')
+        image_ids, image_classes = unique_frames.fetch('image_id', 'image_class', order_by='repeats DESC')
+        num_frames = len(unique_frames)
+        self.insert1({**key, 'n_unique_images': num_frames})
+        
+        # Get number of repeated frames
+        assert len(unique_frames) != 0, 'unique_frames == 0'
+
+        n = int(np.median(unique_frames.fetch('repeats')))  # HACK
+        num_oracles = len(unique_frames & 'repeats > {}'.format(n))  # repeats
+        if num_oracles == 0:
+            raise ValueError('Could not find repeated frames to use for oracle.')
+        
+        if len(dj.U('image_class') & unique_frames) <= 2: # when there are only `imagenet` and `masked_oracle`, this is a bit of hack, not ideal
+            # Compute number of validation examples
+            num_validation = int(np.ceil((num_frames - num_oracles) * 0.1))  # 10% validation examples
+
+            # Fetch images in specific image classes
+            masked_oracle_ids, masked_oracle_classes = (unique_frames & 'image_class = "masked_oracle"').fetch('image_id', 'image_class', order_by='repeats DESC')
+
+            image_ids, image_classes = (unique_frames & IMAGE_CLASSES).fetch('image_id', 'image_class', order_by='repeats DESC')
+
+            # * NOTE: this fetches all oracle images first and the rest in a "random" order;
+            # we use that random order to make the validation/training division below.
+
+            # Insert
+    #         import pdb; pdb.set_trace()
+            if len(masked_oracle_ids) > 0:
+                # Get number of full-field oracles
+                num_oracles = int(num_oracles / 2)
+                self.Image.insert([{**key, 'image_id': iid, 'image_class': ic, 'tier': 'test_masked'} for iid, ic in
+                         zip(masked_oracle_ids, masked_oracle_classes)], skip_duplicates=True)
+                
+            self.Image.insert([{**key, 'image_id': iid, 'image_class': ic, 'tier': 'test'} for iid, ic in
+                         zip(image_ids[:num_oracles], image_classes[:num_oracles])], skip_duplicates=True)
+            self.Image.insert([{**key, 'image_id': iid, 'image_class': ic, 'tier': 'validation'} for
+                         iid, ic in zip(image_ids[num_oracles: num_oracles + num_validation],
+                                        image_classes[num_oracles: num_oracles + num_validation])])
+            self.Image.insert([{**key, 'image_id': iid, 'image_class': ic, 'tier': 'train'} for iid, ic in
+                         zip(image_ids[num_oracles + num_validation:],
+                             image_classes[num_oracles + num_validation:])])
+        
+        else: # when there are more than two image classes
+            train_rels = (dj.U('image_class') & unique_frames & TRAINING_CLASSES).fetch()
+            oracle_rels = (dj.U('image_class') & unique_frames & ORACLE_CLASSES).fetch()
+
+            for rel in oracle_rels:
+                image_ids, image_classes = (unique_frames & 'repeats > {}'.format(n) & rel).fetch('image_id', 'image_class', order_by='repeats DESC')
+                if len(image_classes) > 0 and image_classes[0] == "imagenet":
+                    self.Image.insert([{**key, 'image_id': iid, 'image_class': ic, 'tier': 'test'} for iid, ic in zip(image_ids, image_classes)])
+                elif len(image_classes) > 0 and image_classes[0] == "masked_oracle":
+                    self.Image.insert([{**key, 'image_id': iid, 'image_class': ic, 'tier': 'test_masked'} for iid, ic in zip(image_ids, image_classes)])
+                else:
+                    raise KeyError('Cannot find matching tier for this oracle image class!')
+
+            for rel in train_rels:
+                image_ids, image_classes = (unique_frames & 'repeats = 1' & rel).fetch('image_id', 'image_class', order_by='repeats DESC')
+                if len(image_classes) > 0 :
+                    # Compute number of validation examples
+                    num_validation = int(np.ceil(len(image_ids) * 0.1))  # 10% validation examples
+                    self.Image.insert([{**key, 'image_id': iid, 'image_class': ic, 'tier': 'validation'} for
+                                 iid, ic in zip(image_ids[:num_validation], image_classes[:num_validation])])
+                    self.Image.insert([{**key, 'image_id': iid, 'image_class': ic, 'tier': 'train'} for iid, ic in
+                                 zip(image_ids[num_validation:], image_classes[num_validation:])])
+
+        
 
 @schema
 class ConditionTier(dj.Computed):
     definition = """
-    # split into train, test, validation
+    # split into train, test, validation, and test_masked (if masked oracles are used)
 
     -> stimulus.Condition
     -> StaticScan
@@ -242,13 +358,13 @@ class ConditionTier(dj.Computed):
             # hack for compatibility with previous datasets
             if cond['stimulus_type'] in ['stimulus.Frame', 'stimulus.ColorFrameProjector']:
                 frame_table = (stimulus.Frame if cond['stimulus_type'] == 'stimulus.Frame' else stimulus.ColorFrameProjector)
-
+                    
                 # deal with ImageNet frames first
                 log.info('Inserting assignment from ImageNetSplit')
-                targets = StaticScan * frame_table * ImageNetSplit & (stimulus.Trial & key) & IMAGE_CLASSES
+                targets = StaticScan * frame_table * TempImageNetSplit.Image & (stimulus.Trial & key) & IMAGE_CLASSES
                 print('Inserting {} imagenet conditions!'.format(len(targets)))
                 self.insert(targets, ignore_extra_fields=True)
-
+                
                 # deal with MEI images, assigning tier test for all images
                 assignment = (frame_table & 'image_class in ("cnn_mei", "lin_rf", "multi_cnn_mei", "multi_lin_rf")').proj(tier='"train"')
                 self.insert(StaticScan * frame_table * assignment & (stimulus.Trial & key), ignore_extra_fields=True)
@@ -256,8 +372,14 @@ class ConditionTier(dj.Computed):
                 # make sure that all frames were assigned
                 remaining = (stimulus.Trial * frame_table & key) - self
                 assert len(remaining) == 0, 'There are still unprocessed Frames'
+                
+                # make sure there is no overlap between train and test set
+                log.info('Checking condition {stimulus_type} (n={count})'.format(**cond))
+                frames = (stimulus.Condition() * StaticScan() & key & cond).aggr(stimulus.Trial(), repeats="count(*)",
+                                                                             test='count(*) > 4')
+                self.check_train_test_split(frames, cond)
                 continue
-
+                
             log.info('Checking condition {stimulus_type} (n={count})'.format(**cond))
             frames = (stimulus.Condition() * StaticScan() & key & cond).aggr(stimulus.Trial(), repeats="count(*)",
                                                                              test='count(*) > 4')
@@ -277,7 +399,8 @@ class ConditionTier(dj.Computed):
 
             log.info('Processing training conditions')
             self.fill_up('train', frames, cond, key, m - m_test - m_val)
-
+                
+            
 
 @schema
 class Preprocessing(dj.Lookup):
@@ -400,6 +523,24 @@ class Frame(dj.Computed):
 
         # --- generate response sampling points and sample movie frames relative to it
         self.insert1(dict(key, frame=frame))
+
+
+@schema
+class TrainClass(dj.Lookup):
+    definition = """
+    class_id   :  int
+    image_class:  varchar(16)    # image class name
+    ---
+    table      :  varchar(1024)       # table query to fetch the stimuli for a certain image_class
+    """
+    contents = [(1, 'diverse_mei', 'stimulus.StaticImage.DiverseMEI'),
+                (2, 'mei2', 'stimulus.StaticImage.MEICollection')]
+
+    def get_stim_table(self):
+        """ Return the stimulus tables (datajoint user tables) for a single training image class"""
+        table_strs = self.fetch('table')
+        tables = [eval(table_str) for table_str in table_strs]
+        return tables
 
 
 @h5cached('/external/cache/', mode='array', transfer_to_tmp=False,
@@ -564,6 +705,49 @@ class InputResponse(dj.Computed, FilterMixin):
             images = images.transpose(0, 3, 1, 2)
         hashes = hashes.astype(str)
         types = types.astype(str)
+        
+        # Compute training set mean and std (now only implemented when the only one unique type is stimulus.Frame)
+        def compute_train_stats(trials):
+            train_cond_rel = stimulus.Frame * trials & 'tier = "train"'
+            train_classes = (dj.U('image_class') & train_cond_rel).fetch('image_class')
+
+            train_masks = []
+            train_frames = []
+            for c in train_classes:
+                if c in MASKED_CLASSES: 
+                    stim_tables = (TrainClass & {'image_class': c}).get_stim_table()
+                    useful_tables = 0
+                    for table in stim_tables:
+                        if len(table * (stimulus.Frame * trials & {'image_class': c})) > 0:
+                            useful_tables += 1
+                            if c == 'masked_single':  # fixed mask for all images 
+                                continue
+#                                 mask_params = (StimulusMaskParameters & (table * train_cond_rel & {'image_class': c})).fetch1()
+                            else: # mask dependent on specific image
+                                masks, frames = (base.MEIMask * table * train_cond_rel & {'image_class': c}).fetch('mask', 'frame')
+                    assert (useful_tables == 1), 'The current training image class exist in none or multiple tables defined in TrainClass!'
+
+                elif c in FF_CLASSES:
+                    frames = (stimulus.Frame * trials & {'image_class': c}).fetch('frame')
+                    masks = [np.ones(frames[0].shape)] * len(frames)
+                train_masks.append(np.stack(masks))
+                train_frames.append(np.stack(frames))
+            train_masks = np.vstack(train_masks)
+            train_frames = np.vstack(train_frames)
+
+            # Not sure if this is ideal: compute mean and std of within the mask for each image, and then average across images
+            im_mean = []
+            im_std = []
+            for m, i in zip(train_masks, train_frames):
+                mean = (i * m).sum(axis=(-1, -2), keepdims=True) / m.sum()
+                im_mean.append(mean)
+                im_std.append(np.sqrt(np.sum(((i - mean) ** 2) * m, axis=(-1, -2), keepdims=True) / m.sum()))
+            train_mean = np.mean(im_mean).astype(np.float32)
+            train_std = np.mean(im_std).astype(np.float32)
+
+            return train_mean, train_std
+        
+        train_mean, train_std = compute_train_stats(trials)
 
         # gamma correction
         if (Preprocessing & key).fetch1('gamma'):
@@ -653,7 +837,62 @@ class InputResponse(dj.Computed, FilterMixin):
             area=areas.astype('S')
         )
 
+        def run_input_stats(selector, types, ix, axis=None):
+            
+            if len(np.unique(types)) == 1 and np.unique(types)[0] == 'stimulus.Frame':
+                log.info('Computation of stats compatible with training set containing masked images is used')
+                print('train_mean = {}, train_std = {}'.format(train_mean, train_std))
+                
+                ret = {}
+                for t in np.unique(types):
+                    if not np.any(ix & (types == t)):
+                        continue
+                    data = selector(ix & (types == t))
+
+                    ret[t] = dict(
+                        mean=train_mean,
+                        std=train_std,
+                        min=data.min(axis=axis).astype(np.float32),
+                        max=data.max(axis=axis).astype(np.float32),
+                        median=np.median(data, axis=axis).astype(np.float32)
+                    )
+                data = selector(ix)
+                ret['all'] = dict(
+                    mean=train_mean,
+                    std=train_std,
+                    min=data.min(axis=axis).astype(np.float32),
+                    max=data.max(axis=axis).astype(np.float32),
+                    median=np.median(data, axis=axis).astype(np.float32)
+                )
+                return ret
+            
+            else:
+                log.warning('More than one stimulus type and computation of stats for training set containing masked images is bypassed!')
+                ret = {}
+                for t in np.unique(types):
+                    if not np.any(ix & (types == t)):
+                        continue
+                    data = selector(ix & (types == t))
+
+                    ret[t] = dict(
+                        mean=data.mean(axis=axis).astype(np.float32),
+                        std=data.std(axis=axis, ddof=1).astype(np.float32),
+                        min=data.min(axis=axis).astype(np.float32),
+                        max=data.max(axis=axis).astype(np.float32),
+                        median=np.median(data, axis=axis).astype(np.float32)
+                    )
+                data = selector(ix)
+                ret['all'] = dict(
+                    mean=data.mean(axis=axis).astype(np.float32),
+                    std=data.std(axis=axis, ddof=1).astype(np.float32),
+                    min=data.min(axis=axis).astype(np.float32),
+                    max=data.max(axis=axis).astype(np.float32),
+                    median=np.median(data, axis=axis).astype(np.float32)
+                )
+                return ret
+            
         def run_stats(selector, types, ix, axis=None):
+
             ret = {}
             for t in np.unique(types):
                 if not np.any(ix & (types == t)):
@@ -681,7 +920,7 @@ class InputResponse(dj.Computed, FilterMixin):
         log.info('Computing statistics on training dataset')
         response_statistics = run_stats(lambda ix: responses[ix], types, tiers == 'train', axis=0)
 
-        input_statistics = run_stats(lambda ix: images[ix], types, tiers == 'train')
+        input_statistics = run_input_stats(lambda ix: images[ix], types, tiers == 'train')
 
         statistics = dict(
             images=input_statistics,
