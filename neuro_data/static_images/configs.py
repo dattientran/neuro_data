@@ -3,7 +3,9 @@ from itertools import product
 from attorch.dataloaders import RepeatsBatchSampler
 from torch.utils.data.sampler import SubsetRandomSampler
 
-from neuro_data.static_images.data_schemas import StaticMultiDataset
+# from neuro_data.static_images.data_schemas import StaticMultiDataset
+from neuro_data.static_images.zd_neurodata import StaticMultiDataset
+
 from neuro_data.static_images.transforms import Subsample, Normalizer, ToTensor
 from neuro_data.utils.sampler import SubsetSequentialSampler, BalancedSubsetSampler
 from neuro_data.utils.config import ConfigBase
