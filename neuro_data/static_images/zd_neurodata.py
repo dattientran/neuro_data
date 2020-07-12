@@ -1085,123 +1085,123 @@ class StaticMultiDataset(dj.Manual):
 
 
 ########################
-@schema
-class ClassImageNetSplit(dj.Lookup):
-    definition = """ # split frames in each image_class (or mixed) of each scan into train, validation, and test sets (one sub test set for each image class of oracle images used)
-    -> StaticScan
-    subset_id:          int          # 
-    train_class:        varchar(45)  # description of image classes in the training set one specific image class or mixed)
-    image_class:        varchar(45)  # one specific image class in the current scan
-    ---
-    n_unique_images:    int  # total number of unique images in this scan
-    """
-    class Image(dj.Part):
-        definition = """ 
-        -> master
-        -> stimulus.StaticImage.Image
-        ---
-        -> Tier
-        """
-    def fill(self, scan_key, validation='like_train', include_mixed_classes=False):
-        """ Assign each frame in the specific image class in the current scan to train/test/validation set.
-        Arguments:
-            scan_key: An scan (animal_id, session, scan_idx) that has stimulus.Trials
-                created. Usually one where the stimulus was presented.
-            include_mixed_classes: boolean, whether to add a mixed image_class
-        """
+# @schema
+# class ClassImageNetSplit(dj.Lookup):
+#     definition = """ # split frames in each image_class (or mixed) of each scan into train, validation, and test sets (one sub test set for each image class of oracle images used)
+#     -> StaticScan
+#     subset_id:          int          # 
+#     train_class:        varchar(45)  # description of image classes in the training set one specific image class or mixed)
+#     image_class:        varchar(45)  # one specific image class in the current scan
+#     ---
+#     n_unique_images:    int  # total number of unique images in this scan
+#     """
+#     class Image(dj.Part):
+#         definition = """ 
+#         -> master
+#         -> stimulus.StaticImage.Image
+#         ---
+#         -> Tier
+#         """
+#     def fill(self, scan_key, validation='like_train', include_mixed_classes=False):
+#         """ Assign each frame in the specific image class in the current scan to train/test/validation set.
+#         Arguments:
+#             scan_key: An scan (animal_id, session, scan_idx) that has stimulus.Trials
+#                 created. Usually one where the stimulus was presented.
+#             include_mixed_classes: boolean, whether to add a mixed image_class
+#         """
         
-        key = (StaticScan & scan_key).fetch1('KEY')
+#         key = (StaticScan & scan_key).fetch1('KEY')
         
-        # Find out whether we are using the old pipeline (grayscale only) or the new version
-        if stimulus.Frame & (stimulus.Trial & scan_key):
-            frame_table = stimulus.Frame
-        elif stimulus.ColorFrameProjector & (stimulus.Trial & scan_key):
-            frame_table = stimulus.ColorFrameProjector
-        else:
-            print('Static images were not shown for this scan')
+#         # Find out whether we are using the old pipeline (grayscale only) or the new version
+#         if stimulus.Frame & (stimulus.Trial & scan_key):
+#             frame_table = stimulus.Frame
+#         elif stimulus.ColorFrameProjector & (stimulus.Trial & scan_key):
+#             frame_table = stimulus.ColorFrameProjector
+#         else:
+#             print('Static images were not shown for this scan')
 
-        # Get all image ids in this scan
-        all_frames = frame_table * stimulus.Trial & scan_key & IMAGE_CLASSES
-        classes = (dj.U('image_class') & all_frames).fetch('image_class')
-        all_classes = classes
+#         # Get all image ids in this scan
+#         all_frames = frame_table * stimulus.Trial & scan_key & IMAGE_CLASSES
+#         classes = (dj.U('image_class') & all_frames).fetch('image_class')
+#         all_classes = classes
 
-        if include_mixed_classes:
-            all_classes = np.append(classes, 'mixed')
+#         if include_mixed_classes:
+#             all_classes = np.append(classes, 'mixed')
 
-        for im_class in all_classes:
-            if im_class != 'mixed':
-                unique_frames = dj.U('image_id', 'image_class').aggr(all_frames, repeats='COUNT(*)')
-                num_frames = len(unique_frames)
-                assert num_frames != 0, 'unique_frames == 0'
+#         for im_class in all_classes:
+#             if im_class != 'mixed':
+#                 unique_frames = dj.U('image_id', 'image_class').aggr(all_frames, repeats='COUNT(*)')
+#                 num_frames = len(unique_frames)
+#                 assert num_frames != 0, 'unique_frames == 0'
                 
-                # Insert test set images (one sub test set for each image_class)
-                n = int(np.median(unique_frames.fetch('repeats')))  # HACK
-                oracle_rel = unique_frames & 'repeats > {}'.format(n)
-                non_oracle_rel = (unique_frames & {'image_class': im_class}).proj() - oracle_rel.proj()
-                self.insert1({**key, 'train_class': im_class, 'image_class': im_class, 'n_unique_images': len(non_oracle_rel)+len(oracle_rel)}, skip_duplicates=True)
+#                 # Insert test set images (one sub test set for each image_class)
+#                 n = int(np.median(unique_frames.fetch('repeats')))  # HACK
+#                 oracle_rel = unique_frames & 'repeats > {}'.format(n)
+#                 non_oracle_rel = (unique_frames & {'image_class': im_class}).proj() - oracle_rel.proj()
+#                 self.insert1({**key, 'train_class': im_class, 'image_class': im_class, 'n_unique_images': len(non_oracle_rel)+len(oracle_rel)}, skip_duplicates=True)
 
-                num_oracles = len(oracle_rel)  
-                if num_oracles == 0:
-                    raise ValueError('Could not find repeated frames to use for oracle.')
-                oracle_classes = (dj.U('image_class') & oracle_rel).fetch('image_class')
-                for ora_class in oracle_classes:
-                    oracle_ids = (oracle_rel & {'image_class': ora_class}).fetch('image_id')
-                    if ora_class == 'imagenet':
-                        self.Image.insert([{**key, 'train_class': im_class, 'image_id': iid, 'image_class': ora_class, 'tier': 'test'} for iid in oracle_ids], skip_duplicates=True)
-                    else: 
-                        self.Image.insert([{**key, 'train_class': im_class, 'image_id': iid, 'image_class': ora_class, 'tier': '{}_test'.format(ora_class)} for iid in oracle_ids], skip_duplicates=True)
+#                 num_oracles = len(oracle_rel)  
+#                 if num_oracles == 0:
+#                     raise ValueError('Could not find repeated frames to use for oracle.')
+#                 oracle_classes = (dj.U('image_class') & oracle_rel).fetch('image_class')
+#                 for ora_class in oracle_classes:
+#                     oracle_ids = (oracle_rel & {'image_class': ora_class}).fetch('image_id')
+#                     if ora_class == 'imagenet':
+#                         self.Image.insert([{**key, 'train_class': im_class, 'image_id': iid, 'image_class': ora_class, 'tier': 'test'} for iid in oracle_ids], skip_duplicates=True)
+#                     else: 
+#                         self.Image.insert([{**key, 'train_class': im_class, 'image_id': iid, 'image_class': ora_class, 'tier': '{}_test'.format(ora_class)} for iid in oracle_ids], skip_duplicates=True)
 
-                # Fetch non-oracle images
-                image_ids = non_oracle_rel.fetch('image_id', order_by='repeats DESC')
-                # * NOTE: this fetches all oracle images first and the rest in a "random" order;
-                # we use that random order to make the validation/training division below.
+#                 # Fetch non-oracle images
+#                 image_ids = non_oracle_rel.fetch('image_id', order_by='repeats DESC')
+#                 # * NOTE: this fetches all oracle images first and the rest in a "random" order;
+#                 # we use that random order to make the validation/training division below.
 
-                # Compute number of validation examples
-                num_validation = int(np.ceil(len(image_ids) * 0.1))  # 10% validation examples
+#                 # Compute number of validation examples
+#                 num_validation = int(np.ceil(len(image_ids) * 0.1))  # 10% validation examples
 
-                # Insert
-                self.Image.insert([{**key, 'train_class': im_class, 'image_id': iid, 'image_class': im_class, 'tier': 'validation'} for iid in image_ids[:num_validation]])
-                self.Image.insert([{**key, 'train_class': im_class, 'image_id': iid, 'image_class': im_class, 'tier': 'train'} for iid in image_ids[num_validation:]])
+#                 # Insert
+#                 self.Image.insert([{**key, 'train_class': im_class, 'image_id': iid, 'image_class': im_class, 'tier': 'validation'} for iid in image_ids[:num_validation]])
+#                 self.Image.insert([{**key, 'train_class': im_class, 'image_id': iid, 'image_class': im_class, 'tier': 'train'} for iid in image_ids[num_validation:]])
             
-            else:
-                unique_frames = dj.U('image_id').aggr(all_frames & [{'image_class': ic} for ic in classes], repeats='COUNT(*)')
-                num_frames = len(unique_frames)
-                assert num_frames != 0, 'unique_frames == 0'
+#             else:
+#                 unique_frames = dj.U('image_id').aggr(all_frames & [{'image_class': ic} for ic in classes], repeats='COUNT(*)')
+#                 num_frames = len(unique_frames)
+#                 assert num_frames != 0, 'unique_frames == 0'
                 
-                # Insert test set images (one sub test set for each image_class)
-                n = int(np.median(unique_frames.fetch('repeats')))  # HACK
-                oracle_rel = unique_frames & 'repeats > {}'.format(n)
-                num_oracles = len(oracle_rel)  # repeats
-                if num_oracles == 0:
-                    raise ValueError('Could not find repeated frames to use for oracle.')
-                oracle_classes = (dj.U('image_class') & oracle_rel).fetch('image_class')
-                for ora_class in oracle_classes:
-                    oracle_ids = (oracle_rel & {'image_class': ora_class}).fetch('image_id')
-                    if ora_class == 'imagenet':
-                        self.Image.insert([{**key, 'image_id': iid, 'image_class': ora_class, 'tier': 'test'} for iid in oracle_ids], skip_duplicates=True)
-                    else: 
-                        self.Image.insert([{**key, 'image_id': iid, 'image_class': ora_class, 'tier': '{}_test'.format(ora_class)} for iid in oracle_ids], skip_duplicates=True)
+#                 # Insert test set images (one sub test set for each image_class)
+#                 n = int(np.median(unique_frames.fetch('repeats')))  # HACK
+#                 oracle_rel = unique_frames & 'repeats > {}'.format(n)
+#                 num_oracles = len(oracle_rel)  # repeats
+#                 if num_oracles == 0:
+#                     raise ValueError('Could not find repeated frames to use for oracle.')
+#                 oracle_classes = (dj.U('image_class') & oracle_rel).fetch('image_class')
+#                 for ora_class in oracle_classes:
+#                     oracle_ids = (oracle_rel & {'image_class': ora_class}).fetch('image_id')
+#                     if ora_class == 'imagenet':
+#                         self.Image.insert([{**key, 'image_id': iid, 'image_class': ora_class, 'tier': 'test'} for iid in oracle_ids], skip_duplicates=True)
+#                     else: 
+#                         self.Image.insert([{**key, 'image_id': iid, 'image_class': ora_class, 'tier': '{}_test'.format(ora_class)} for iid in oracle_ids], skip_duplicates=True)
                 
-                selected = []
-                non_oracle_rel = (unique_frames.proj() - oracle_rel.proj())
-                num_images_per_class = int(np.floor(len(non_oracle_rel)/len(classes)))
-                for i, ic in enumerate(classes):
-                    # Fetch non-oracle images of a specific image class
-                    image_ids = (non_oracle_rel & {'image_class': ic}).fetch('image_id', order_by='image_id')
-                    assert len(image_ids) != num_images_per_class, 'Unequal number of images in each image class!'
-                    if i == 0:
-                        selected_image_ids = np.random.choice(image_ids, num_images_per_class)
-                    else:
-                        rest = np.array(set(image_ids) - set(selected))
-                        selected_image_ids = np.random.choice(rest, num_images_per_class)
-                    selected.append(selected_image_ids)
+#                 selected = []
+#                 non_oracle_rel = (unique_frames.proj() - oracle_rel.proj())
+#                 num_images_per_class = int(np.floor(len(non_oracle_rel)/len(classes)))
+#                 for i, ic in enumerate(classes):
+#                     # Fetch non-oracle images of a specific image class
+#                     image_ids = (non_oracle_rel & {'image_class': ic}).fetch('image_id', order_by='image_id')
+#                     assert len(image_ids) != num_images_per_class, 'Unequal number of images in each image class!'
+#                     if i == 0:
+#                         selected_image_ids = np.random.choice(image_ids, num_images_per_class)
+#                     else:
+#                         rest = np.array(set(image_ids) - set(selected))
+#                         selected_image_ids = np.random.choice(rest, num_images_per_class)
+#                     selected.append(selected_image_ids)
 
-                    # Compute number of validation examples
-                    num_validation = int(np.ceil(len(selected_image_ids) * 0.1))  # 10% validation examples
+#                     # Compute number of validation examples
+#                     num_validation = int(np.ceil(len(selected_image_ids) * 0.1))  # 10% validation examples
 
-                    # Insert
-                    self.Image.insert([{**key, 'image_id': iid, 'image_class': ic, 'tier': 'validation'} for iid in selected_image_ids[:num_validation]])
-                    self.Image.insert([{**key, 'image_id': iid, 'image_class': ic, 'tier': 'train'} for iid in selected_image_ids[num_validation:]])
+#                     # Insert
+#                     self.Image.insert([{**key, 'image_id': iid, 'image_class': ic, 'tier': 'validation'} for iid in selected_image_ids[:num_validation]])
+#                     self.Image.insert([{**key, 'image_id': iid, 'image_class': ic, 'tier': 'train'} for iid in selected_image_ids[num_validation:]])
 
 # def oracle_score(key, tier):
 #     # --- load data
