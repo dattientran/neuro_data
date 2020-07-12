@@ -295,6 +295,8 @@ class h5cached:
                 raise ValueError('Can only return one dataset!')
 
             k = (oself & key).proj().fetch1()
+            if 'subset_id' in key.keys():
+                k['subset_id'] = key['subset_id']
 
             if self.file_format is None:
                 hash = key_hash(dict(k, _class_name=cls.__name__, **kwargs))
