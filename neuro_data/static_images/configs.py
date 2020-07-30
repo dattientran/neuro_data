@@ -206,7 +206,7 @@ class StimulusTypeMixin:
             A subclass of Sampler
 
         """
-        assert tier in ['train', 'validation', 'test', 'test_masked', None] 
+        assert tier in ['train', 'validation', 'test', 'test_masked', 'test_exciting', None] 
         if tier == 'train':
             if not balanced:
                 Sampler = SubsetRandomSampler
@@ -525,7 +525,7 @@ class ToyStimulusTypeMixin:
             A subclass of Sampler
 
         """
-        assert tier in ['train', 'validation', 'test', 'test_masked', None] 
+        assert tier in ['train', 'validation', 'test', 'test_masked', 'test_exciting', None] 
         if tier == 'train':
             if not balanced:
                 Sampler = SubsetRandomSampler

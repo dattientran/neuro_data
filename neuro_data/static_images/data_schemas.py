@@ -34,11 +34,11 @@ UNIQUE_FRAME = {
     'stimulus.ColorFrameProjector': ('image_id', 'image_class'),
 }
 
-IMAGE_CLASSES = 'image_class in ("imagenet", "masked_oracle", "masked_single", "diverse_mei", "searched_nat", "mei2", "imagenet_v2_gray", "imagenet_v2_rgb")' # all valid natural image classes
-ORACLE_CLASSES = 'image_class in ("imagenet", "masked_oracle")'
-TRAINING_CLASSES = 'image_class in ("imagenet", "masked_single", "searched_nat", "diverse_mei", "mei2")'
+IMAGE_CLASSES = 'image_class in ("imagenet", "masked_oracle", "masked_single", "diverse_mei", "searched_nat", "mei2", "imagenet_v2_gray", "imagenet_v2_rgb", "gaudy_imagenet2", "exciting_imagenet")' # all valid natural image classes
+ORACLE_CLASSES = 'image_class in ("imagenet", "masked_oracle", "gaudy_imagenet2", "exciting_imagenet")'
+TRAINING_CLASSES = 'image_class in ("imagenet", "masked_single", "searched_nat", "diverse_mei", "mei2", "gaudy_imagenet2")'
 MASKED_CLASSES = ['diverse_mei', 'mei2', 'masked_single']
-FF_CLASSES = ['imagenet', 'searched_nat']
+FF_CLASSES = ['imagenet', 'searched_nat', 'gaudy_imagenet2', 'exciting_imagenet']
     
 @schema
 class StaticScanCandidate(dj.Manual):
@@ -99,7 +99,7 @@ class Tier(dj.Lookup):
 
     @property
     def contents(self):
-        yield from zip(["train", "test", "test_masked", "validation"])
+        yield from zip(["train", "test", "test_masked", "test_exciting", "validation"])
 
 
 @schema
@@ -233,26 +233,31 @@ class TempImageNetSplit(dj.Lookup):
         if num_oracles == 0:
             raise ValueError('Could not find repeated frames to use for oracle.')
         
-        if len(dj.U('image_class') & unique_frames) <= 2: # when there are only `imagenet` and `masked_oracle`, this is a bit of hack, not ideal
+        if len(dj.U('image_class') & unique_frames) <= 2: # fewer than two image classes, this is a bit of hack, not ideal
             # Compute number of validation examples
             num_validation = int(np.ceil((num_frames - num_oracles) * 0.1))  # 10% validation examples
 
             # Fetch images in specific image classes
-            masked_oracle_ids, masked_oracle_classes = (unique_frames & 'image_class = "masked_oracle"').fetch('image_id', 'image_class', order_by='repeats DESC')
+#             masked_oracle_ids, masked_oracle_classes = (unique_frames & 'image_class = "masked_oracle"').fetch('image_id', 'image_class', order_by='repeats DESC')
+            exciting_oracle_ids, exciting_oracle_classes = (unique_frames & 'image_class = "exciting_imagenet"').fetch('image_id', 'image_class', order_by='repeats DESC')
 
-            image_ids, image_classes = (unique_frames & IMAGE_CLASSES).fetch('image_id', 'image_class', order_by='repeats DESC')
+            image_ids, image_classes = (unique_frames & IMAGE_CLASSES & 'image_class = "imagenet"').fetch('image_id', 'image_class', order_by='repeats DESC')
 
             # * NOTE: this fetches all oracle images first and the rest in a "random" order;
             # we use that random order to make the validation/training division below.
 
             # Insert
-    #         import pdb; pdb.set_trace()
-            if len(masked_oracle_ids) > 0:
+#             if len(masked_oracle_ids) > 0:
+#                 # Get number of full-field oracles
+#                 num_oracles = int(num_oracles / 2)
+#                 self.Image.insert([{**key, 'image_id': iid, 'image_class': ic, 'tier': 'test_masked'} for iid, ic in
+#                          zip(masked_oracle_ids, masked_oracle_classes)], skip_duplicates=True)
+                
+            if len(exciting_oracle_ids) > 0:
                 # Get number of full-field oracles
                 num_oracles = int(num_oracles / 2)
-                self.Image.insert([{**key, 'image_id': iid, 'image_class': ic, 'tier': 'test_masked'} for iid, ic in
-                         zip(masked_oracle_ids, masked_oracle_classes)], skip_duplicates=True)
-                
+                self.Image.insert([{**key, 'image_id': iid, 'image_class': ic, 'tier': 'test_exciting'} for iid, ic in
+                         zip(exciting_oracle_ids, exciting_oracle_classes)], skip_duplicates=True)
             self.Image.insert([{**key, 'image_id': iid, 'image_class': ic, 'tier': 'test'} for iid, ic in
                          zip(image_ids[:num_oracles], image_classes[:num_oracles])], skip_duplicates=True)
             self.Image.insert([{**key, 'image_id': iid, 'image_class': ic, 'tier': 'validation'} for
@@ -920,7 +925,7 @@ class InputResponse(dj.Computed, FilterMixin):
         log.info('Computing statistics on training dataset')
         response_statistics = run_stats(lambda ix: responses[ix], types, tiers == 'train', axis=0)
 
-        input_statistics = run_input_stats(lambda ix: images[ix], types, tiers == 'train')
+        input_statistics = run_stats(lambda ix: images[ix], types, tiers == 'train')
 
         statistics = dict(
             images=input_statistics,
@@ -1174,7 +1179,6 @@ class StaticMultiDataset(dj.Manual):
     def fetch_data(self, key, key_order=None):
         assert len(self & key) == 1, 'Key must refer to exactly one multi dataset'
         ret = OrderedDict()
-        log.info('Fetching data for ' +  repr(key))
         for mkey in (self.Member() & key).fetch(dj.key,
                                                 order_by='animal_id ASC, session ASC, scan_idx ASC, preproc_id ASC'):
             name = (self.Member() & mkey).fetch1('name')
@@ -1195,3 +1199,25 @@ class StaticMultiDataset(dj.Manual):
                 (k, ret[k]) for k in key_order
             ])
         return ret
+    
+imagenet = dj.create_virtual_module('pipeline_imagenet', 'pipeline_imagenet')
+@schema
+class FakeImagenetStimuli(dj.Computed):
+    definition = """
+    -> imagenet.Album
+    -> Preprocessing
+    image_id:   int  # same image_id as in stimulus.StaticImage.Image
+    row_id:     int  # oracle image repeats will have the same image_ids but unique row_ids
+    ---
+    image:      longblob # preprocessed image
+    """
+    
+    def make(self, key):
+        single_keys, single_images = (stimulus.StaticImage.Image * imagenet.Album.Single & key).fetch('KEY', 'image')
+        oracle_keys, oracle_images = (stimulus.StaticImage.Image * imagenet.Album.Oracle & key).fetch('KEY', 'image')
+        image_keys = np.concatenate([single_keys, np.tile(oracle_keys, 10)])
+        images = np.concatenate([single_images, np.tile(oracle_images, 10)])
+        for i, (k, im) in enumerate(zip(image_keys, images)):
+            k['preproc_id'] = key['preproc_id']
+            im = process_frame(k, im)
+            self.insert1({**k, 'row_id': i, 'image': im})
