@@ -62,8 +62,10 @@ class CellMatchParameters(dj.Lookup):
     edge_thresh:        float       # any cell whose centroid is < number of microns to the edge will be discarded (<=0 to not discard)
     oracle_thresh:     float        # any cells with less than this oracle will be discarded
     cnnperf_thresh:    float        # any cells with less than this cnn performance will be discarded
+    unique_match_per_pair: tinyint  # for each pair of scans, whether to keep only one unique target cell (the best quality one) that each source cell is matched to
     """
-    contents = [(1, 0.6, 15, 0, -1, -1)]
+    contents = [(1, 0.6, 15, 0, -1, -1, 1),
+                (2, 0.6, 15, 0, -1, -1, 0)]
     
     
 @schema
@@ -76,7 +78,8 @@ class MultipleDatasets(dj.Computed):
     
     @property
     def key_source(self):
-        return loop.LoopGroup * StaticMultiDataset * CellMatchParameters & 'match_params = 1' # need to restrict by loop_group and group_id
+        return loop.LoopGroup * StaticMultiDataset * CellMatchParameters  # need to restrict by loop_group, group_id, match_params
+   
     class MatchedCells(dj.Part):
         definition = """ # Matched cells (in the same order) in each member scan of the multi dataset
         -> master
@@ -87,47 +90,115 @@ class MultipleDatasets(dj.Computed):
         """
     
     def make(self, key):
-        src_rel = loop.ClosedLoopScan * (StaticMultiDataset.Member & key) & 'mei_source = 1'
-        src_key = src_rel.proj('name').fetch1()
-        # For now only deals with one target scan
-        target_key = (loop.ClosedLoopScan * (StaticMultiDataset.Member & key) & 'mei_source = 0' & {'loop_group': src_key['loop_group']}).proj('name').fetch1()
-        
-        # Get oracle correlation matrix
-        src_units, corr = (loop.CellMatchOracleCorrelation & target_key).fetch1('units', 'corr_matrix')
-
-        # Get unit ids within V1 ROI
-        if len(dj.U('brain_area') & (anatomy.AreaMembership & src_key)) > 1:
-            v1roi = (dj.U('field') & (anatomy.AreaMask() & src_rel & 'brain_area = "V1"')) - (dj.U('field') & (anatomy.AreaMask() & src_rel & 'brain_area = "PM"'))
-            src_unit_ids, target_unit_ids, distance = (loop.TempBestProximityCellMatch2 & target_key & (meso.ScanSet.Unit & src_rel & v1roi).proj(src_session='session', src_scan_idx='scan_idx', src_unit_id='unit_id')).fetch('src_unit_id', 'unit_id', 'mean_distance', order_by='src_unit_id')
-        else:
-            src_unit_ids, target_unit_ids, distance = (loop.TempBestProximityCellMatch2 & target_key & (meso.ScanSet.Unit & src_rel).proj(src_session='session', src_scan_idx='scan_idx', src_unit_id='unit_id')).fetch('src_unit_id', 'unit_id', 'mean_distance', order_by='src_unit_id')
-            
-        idx = np.array([np.argwhere(src_units == u).item() for u in src_unit_ids])
-        diag = np.diag(corr)[idx]
-            
-
-        # Filter out matched pairs that do not satisfy thresholds on oracle correlation and max distance 
         match_params = (CellMatchParameters & key).fetch1()
-        oraclecorr_thre = match_params['oraclecorr_thre']
-        distance_thre = match_params['distance_thre']
-        valid_src_unit_ids = src_unit_ids[(diag > oraclecorr_thre) & (distance < distance_thre)]
-        valid_target_unit_ids = target_unit_ids[(diag > oraclecorr_thre) & (distance < distance_thre)]
-        valid_corr = diag[(diag > oraclecorr_thre) & (distance < distance_thre)]
-        valid_distance = distance[(diag > oraclecorr_thre) & (distance < distance_thre)]
+        if key['loop_group'] < 7: # these loops only combine at most 2 scans
+            src_rel = loop.ClosedLoopScan * (StaticMultiDataset.Member & key) & 'mei_source = 1'
+            src_key = src_rel.proj('name').fetch1()
+            # For now only deals with one target scan
+            target_key = (loop.ClosedLoopScan * (StaticMultiDataset.Member & key) & 'mei_source = 0' & {'loop_group': src_key['loop_group']}).proj('name').fetch1()
 
-        # Iteratively take the most correlated pairs for units matched to the same target unit
-        keep_src_units = []
-        keep_target_units = []
-        for src, target, corr in sorted(zip(valid_src_unit_ids, valid_target_unit_ids, valid_corr), key=lambda x: x[-1], reverse=True):
-            if target not in keep_target_units:
-                keep_src_units.append(src)
-                keep_target_units.append(target)
+            # Get oracle correlation matrix
+            src_units, corr = (loop.CellMatchOracleCorrelation & target_key).fetch1('units', 'corr_matrix')
+
+            # Get unit ids within V1 ROI
+            if len(dj.U('brain_area') & (anatomy.AreaMembership & src_key)) > 1:
+                v1roi = (dj.U('field') & (anatomy.AreaMask() & src_rel & 'brain_area = "V1"')) - (dj.U('field') & (anatomy.AreaMask() & src_rel & 'brain_area = "PM"'))
+                src_unit_ids, target_unit_ids, distance = (loop.TempBestProximityCellMatch2 & target_key & (meso.ScanSet.Unit & src_rel & v1roi).proj(src_session='session', src_scan_idx='scan_idx', src_unit_id='unit_id')).fetch('src_unit_id', 'unit_id', 'mean_distance', order_by='src_unit_id')
+            else:
+                src_unit_ids, target_unit_ids, distance = (loop.TempBestProximityCellMatch2 & target_key & (meso.ScanSet.Unit & src_rel).proj(src_session='session', src_scan_idx='scan_idx', src_unit_id='unit_id')).fetch('src_unit_id', 'unit_id', 'mean_distance', order_by='src_unit_id')
+
+            idx = np.array([np.argwhere(src_units == u).item() for u in src_unit_ids])
+            diag = np.diag(corr)[idx]
+
+
+            # Filter out matched pairs that do not satisfy thresholds on oracle correlation and max distance 
+            oraclecorr_thre = match_params['oraclecorr_thre']
+            distance_thre = match_params['distance_thre']
+            valid_src_unit_ids = src_unit_ids[(diag > oraclecorr_thre) & (distance < distance_thre)]
+            valid_target_unit_ids = target_unit_ids[(diag > oraclecorr_thre) & (distance < distance_thre)]
+            valid_corr = diag[(diag > oraclecorr_thre) & (distance < distance_thre)]
+            valid_distance = distance[(diag > oraclecorr_thre) & (distance < distance_thre)]
+
+            # Iteratively take the most correlated pairs for units matched to the same target unit
+            keep_src_units = []
+            keep_target_units = []
+            for src, target, corr in sorted(zip(valid_src_unit_ids, valid_target_unit_ids, valid_corr), key=lambda x: x[-1], reverse=True):
+                if target not in keep_target_units:
+                    keep_src_units.append(src)
+                    keep_target_units.append(target)
+
+            self.insert1(key)
+            self.MatchedCells.insert1({**src_key, 'match_params': key['match_params'], 'matched_cells': keep_src_units})
+            self.MatchedCells.insert1({**target_key, 'match_params': key['match_params'], 'matched_cells': keep_target_units})
+    
+        else:
+            keys, d1, d2, corr_matrix = (loop.PairScanCellMatchOracleCorr & key).fetch('KEY', 'src_units', 'target_units', 'corr_matrix')
+            keep = []
+            all_diags = []
+            all_target_keys = []
+            all_target_units = []
+
+            for k, d1_units, d2_units, corr in zip(keys, d1, d2, corr_matrix):
+                diag = np.diag(corr)
+                all_diags.append(diag)
+                d1_key = (StaticMultiDataset.Member & key & {'animal_id': k['animal_id'], 'session': k['src_session'], 'scan_idx': k['src_scan_idx'], 'loop_group': k['loop_group']}).fetch1()
+                d2_key = (StaticMultiDataset.Member & key & {'animal_id': k['animal_id'], 'session': k['target_session'], 'scan_idx': k['target_scan_idx'], 'loop_group': k['loop_group']}).fetch1()
+
+                # Compute mean distance between matched cells
+                if (loop.ClosedLoopScan & d1_key).fetch1('mei_source'): # when src key is has mei_source=1 (day 1 scan)
+                    src_key = d1_key.copy()
+                    src_units = d1_units.copy()
+                    all_target_keys.append(d2_key)
+                    all_target_units.append(d2_units)
+                    distance = (loop.TempBestProximityCellMatch2 & d2_key & {'src_session': d1_key['session'], 'src_scan_idx': d1_key['scan_idx']}).fetch('mean_distance', order_by='src_unit_id')
+
+                else: # when src key is has mei_source!=1 (a scan after day 1)
+                    distance = []
+                    for d1_u, d2_u in zip(d1_units, d2_units):
+                        d1x, d1y, d1z = (meso.StackCoordinates.UnitInfo() & d1_key & 'segmentation_method = 6' & {'unit_id': d1_u}).fetch('stack_x', 'stack_y', 'stack_z', order_by=('stack_session', 'stack_idx'))
+                        d2x, d2y, d2z = (meso.StackCoordinates.UnitInfo() & d2_key & 'segmentation_method = 6' & {'unit_id': d2_u}).fetch('stack_x', 'stack_y', 'stack_z', order_by=('stack_session', 'stack_idx'))
+                        dist = []
+                        for x1, y1, z1, x2, y2, z2 in zip(d1x, d1y, d1z, d2x, d2y, d2z):
+                            dist.append(np.sqrt((x1-x2)**2 + (y1-y2)**2 + (z1-z2)**2))
+                        distance.append(np.mean(dist))
+
+                # Select matched pairs that satisfy thresholds on oracle correlation and max distance 
+                oraclecorr_thre = match_params['oraclecorr_thre']
+                distance_thre = match_params['distance_thre']
+                keep.append((diag > oraclecorr_thre) & (np.array(distance) < distance_thre))
+
+            # Select satisfied matched pairs across all pairs of datasets
+            all_keep = keep[0]
+            for i in range(len(keep)):
+                all_keep *= keep[i]
+
+            keep_src_units = src_units[all_keep]
+            keep_target_units = np.stack(all_target_units)[:, all_keep]
+
+            # Keep only one unique unit in each dataset
+            if match_params['unique_match_per_pair']:
+                all_keep_idx = []
+                for units, corrs in zip(keep_target_units, all_diags): # for each target dataset
+                    keep_units, keep_idx = [], []
+                    for (i, u), corr in sorted(zip(enumerate(units), corrs), key=lambda x: x[-1], reverse=True): # iteratively select the idx with highest correlation to keep
+                        if u not in keep_units:
+                            keep_units.append(u)
+                            keep_idx.append(i)
+                    all_keep_idx.append(keep_idx)
+                final_keep_idx = list(set.intersection(*map(set, all_keep_idx)))
+
+                keep_src_units = keep_src_units[final_keep_idx]
+                keep_target_units = keep_target_units[:, final_keep_idx]
                 
-        self.insert1(key)
-        self.MatchedCells.insert1({**src_key, 'match_params': key['match_params'], 'matched_cells': keep_src_units})
-        self.MatchedCells.insert1({**target_key, 'match_params': key['match_params'], 'matched_cells': keep_target_units})
+                for units in keep_target_units:
+                    assert len(units) == len(np.unique(units)), 'Matched units not unique in target datasets!'
 
+            self.insert1(key)
+            self.MatchedCells.insert1({**key, **src_key, 'matched_cells': keep_src_units})
+            for target_key, target_units in zip(all_target_keys, keep_target_units):
+                self.MatchedCells.insert1({**key, **target_key, 'matched_cells': target_units})
 
+                    
 class BackwardCompatibilityMixin:
     """
     Backward compatibility layer: namely use of the buggy Normalizer
@@ -206,7 +277,7 @@ class StimulusTypeMixin:
             A subclass of Sampler
 
         """
-        assert tier in ['train', 'validation', 'test', 'test_masked', 'test_exciting', None] 
+        assert tier in ['train', 'validation', 'test', 'test_masked', 'test_exciting', 'test_ff', 'test_mei', None] 
         if tier == 'train':
             if not balanced:
                 Sampler = SubsetRandomSampler
@@ -404,12 +475,17 @@ class AreaLayerMatchedCellMixin(StimulusTypeMixin):
             log.info('Subsampling to matched cells in scan {} in group {}'.format(readout_key, key['group_id']))
 
             units = dataset.neurons.unit_ids[idx]
-            if len(MultipleDatasets.MatchedCells() & {'name': readout_key}) > 0:    # when combining datasets
-                desired_units = (MultipleDatasets.MatchedCells() & {'name': readout_key}).fetch1('matched_cells')
-            else:    # hack: when only use matched cells from one dataset (as a control to compare model performance)
-                animal, session, scan = (StaticMultiDataset.Member & key).fetch1('animal_id', 'session', 'scan_idx')
-                desired_units = (MultipleDatasets.MatchedCells & {'animal_id': animal, 'session': session, 'scan_idx': scan}).fetch1('matched_cells')
-
+            
+            if key['use_latest_match']: # when only use matched cells from the last group of a combined dataset (as a control to compare model performance)
+                animal, session, scan = (StaticMultiDataset.Member & {'name': readout_key}).fetch1('animal_id', 'session', 'scan_idx')
+                desired_units = (MultipleDatasets.MatchedCells & {'animal_id': animal, 'session': session, 'scan_idx': scan}).fetch('matched_cells', order_by='group_id')[-1]
+            else:
+                if len(MultipleDatasets.MatchedCells() & {'name': readout_key}) > 0:    # when combining datasets
+                    desired_units = (MultipleDatasets.MatchedCells() & {'name': readout_key}).fetch1('matched_cells')
+                else:    # hack: when only use matched cells from one dataset (as a control to compare model performance)
+                    animal, session, scan = (StaticMultiDataset.Member & key).fetch1('animal_id', 'session', 'scan_idx')
+                    desired_units = (MultipleDatasets.MatchedCells & {'animal_id': animal, 'session': session, 'scan_idx': scan}).fetch1('matched_cells')
+                
             unit_idx = np.array([np.argwhere(units == u).item() for u in desired_units])
             len_idx.append(len(unit_idx))
           
@@ -735,6 +811,7 @@ class DataConfig(ConfigBase, dj.Lookup):
         normalize_per_image     : bool          # whether to normalize each input separately
         -> experiment.Layer
         -> anatomy.Area
+        use_latest_match        : bool          # whether to use the latest matched cells (from the biggest group_id where the largest number of datasets are combined)
         """
 
         def describe(self, key):
@@ -749,7 +826,8 @@ class DataConfig(ConfigBase, dj.Lookup):
                              [True],
                              [True, False],
                              ['L4', 'L2/3'],
-                             ['V1', 'LM', 'RL', 'AL']):
+                             ['V1', 'LM', 'RL', 'AL'],
+                             [True, False]):
                 yield dict(zip(self.heading.dependent_attributes, p))
                 
     class ToyCorrectedAreaLayer(dj.Part, ToyAreaLayerRawMixin):
