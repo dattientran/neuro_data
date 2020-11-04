@@ -24,6 +24,7 @@ experiment = dj.create_virtual_module('experiment', 'pipeline_experiment')
 anatomy = dj.create_virtual_module('anatomy', 'pipeline_anatomy')
 meso = dj.create_virtual_module('meso', 'pipeline_meso')
 loop = dj.create_virtual_module('loop', 'neurostatic_zhiwei_loop')
+crossval = dj.create_virtual_module('neurostatic_crossval', 'neurostatic_crossval')
 
 schema = dj.schema('neurodata_static_configs')
 
@@ -140,7 +141,6 @@ class MultipleDatasets(dj.Computed):
 
             for k, d1_units, d2_units, corr in zip(keys, d1, d2, corr_matrix):
                 diag = np.diag(corr)
-                all_diags.append(diag)
                 d1_key = (StaticMultiDataset.Member & key & {'animal_id': k['animal_id'], 'session': k['src_session'], 'scan_idx': k['src_scan_idx'], 'loop_group': k['loop_group']}).fetch1()
                 d2_key = (StaticMultiDataset.Member & key & {'animal_id': k['animal_id'], 'session': k['target_session'], 'scan_idx': k['target_scan_idx'], 'loop_group': k['loop_group']}).fetch1()
 
@@ -150,6 +150,7 @@ class MultipleDatasets(dj.Computed):
                     src_units = d1_units.copy()
                     all_target_keys.append(d2_key)
                     all_target_units.append(d2_units)
+                    all_diags.append(diag)
                     distance = (loop.TempBestProximityCellMatch2 & d2_key & {'src_session': d1_key['session'], 'src_scan_idx': d1_key['scan_idx']}).fetch('mean_distance', order_by='src_unit_id')
 
                 else: # when src key is has mei_source!=1 (a scan after day 1)
@@ -172,13 +173,27 @@ class MultipleDatasets(dj.Computed):
             for i in range(len(keep)):
                 all_keep *= keep[i]
 
-            keep_src_units = src_units[all_keep]
-            keep_target_units = np.stack(all_target_units)[:, all_keep]
+            # # OLD METHOD
+            # old_keep_src_units = src_units[all_keep]
+            # old_keep_target_units = all_target_units[0][all_keep]
+
+            # # Iteratively take the most correlated pairs for units matched to the same target unit
+            # final_src_units = []
+            # final_target_units = []
+            # for src, target, corr in sorted(zip(old_keep_src_units, old_keep_target_units, diag[all_keep]), key=lambda x: x[-1], reverse=True):
+            #     if target not in final_target_units:
+            #         final_src_units.append(src)
+            #         final_target_units.append(target)
+
+            # CURRENT METHOD
+            current_keep_src_units = src_units[all_keep]
+            current_keep_target_units = np.stack(all_target_units)[:, all_keep]
+            all_diags = np.stack(all_diags)[:, all_keep] # BUG: for group 188-193, forgot to add this line, so some of selected unique src_units are not the ones with highest correlation with the target_units
 
             # Keep only one unique unit in each dataset
             if match_params['unique_match_per_pair']:
                 all_keep_idx = []
-                for units, corrs in zip(keep_target_units, all_diags): # for each target dataset
+                for units, corrs in zip(current_keep_target_units, all_diags): # for each target dataset
                     keep_units, keep_idx = [], []
                     for (i, u), corr in sorted(zip(enumerate(units), corrs), key=lambda x: x[-1], reverse=True): # iteratively select the idx with highest correlation to keep
                         if u not in keep_units:
@@ -187,8 +202,8 @@ class MultipleDatasets(dj.Computed):
                     all_keep_idx.append(keep_idx)
                 final_keep_idx = list(set.intersection(*map(set, all_keep_idx)))
 
-                keep_src_units = keep_src_units[final_keep_idx]
-                keep_target_units = keep_target_units[:, final_keep_idx]
+                keep_src_units = current_keep_src_units[final_keep_idx]
+                keep_target_units = current_keep_target_units[:, final_keep_idx]
                 
                 for units in keep_target_units:
                     assert len(units) == len(np.unique(units)), 'Matched units not unique in target datasets!'
@@ -476,15 +491,22 @@ class AreaLayerMatchedCellMixin(StimulusTypeMixin):
 
             units = dataset.neurons.unit_ids[idx]
             
-            if key['use_latest_match']: # when only use matched cells from the last group of a combined dataset (as a control to compare model performance)
+            if key['cell_match_table'] == 'neurodata_static_configs.MultipleDatasets':
+                if key['use_latest_match']: # when only use matched cells from the last group of a combined dataset (as a control to compare model performance)
+                    animal, session, scan = (StaticMultiDataset.Member & {'name': readout_key}).fetch1('animal_id', 'session', 'scan_idx')
+                    desired_units = (MultipleDatasets.MatchedCells & {'animal_id': animal, 'session': session, 'scan_idx': scan}).fetch('matched_cells', order_by='group_id')[-1]
+                else:
+                    if len(MultipleDatasets.MatchedCells() & {'name': readout_key}) > 0:    # when combining datasets
+                        desired_units = (MultipleDatasets.MatchedCells() & {'name': readout_key}).fetch1('matched_cells')
+                    else:    # hack: when only use matched cells from one dataset (as a control to compare model performance)
+                        animal, session, scan = (StaticMultiDataset.Member & key).fetch1('animal_id', 'session', 'scan_idx')
+                        desired_units = (MultipleDatasets.MatchedCells & {'animal_id': animal, 'session': session, 'scan_idx': scan}).fetch1('matched_cells')
+                        
+            elif key['cell_match_table'] == 'neurostatic_crossval.UnitMatching':
                 animal, session, scan = (StaticMultiDataset.Member & {'name': readout_key}).fetch1('animal_id', 'session', 'scan_idx')
-                desired_units = (MultipleDatasets.MatchedCells & {'animal_id': animal, 'session': session, 'scan_idx': scan}).fetch('matched_cells', order_by='group_id')[-1]
-            else:
-                if len(MultipleDatasets.MatchedCells() & {'name': readout_key}) > 0:    # when combining datasets
-                    desired_units = (MultipleDatasets.MatchedCells() & {'name': readout_key}).fetch1('matched_cells')
-                else:    # hack: when only use matched cells from one dataset (as a control to compare model performance)
-                    animal, session, scan = (StaticMultiDataset.Member & key).fetch1('animal_id', 'session', 'scan_idx')
-                    desired_units = (MultipleDatasets.MatchedCells & {'animal_id': animal, 'session': session, 'scan_idx': scan}).fetch1('matched_cells')
+                num_groups = len(StaticMultiDataset.Member & key)
+                shared_rel = dj.U("match_id").aggr(dj.U("group_id", "match_id").aggr(crossval.UnitMatching.Match & "match_params = {}".format(1), c="COUNT(*)"), num_groups='COUNT(c)') & {'num_groups': num_groups}
+                desired_units, match_ids, = (crossval.UnitMatching.Match * StaticMultiDataset.Member() & 'match_params = 1' & shared_rel.proj() & {'animal_id': animal, 'session': session, 'scan_idx': scan}).fetch('unit_id', 'match_id', order_by='unit_id')
                 
             unit_idx = np.array([np.argwhere(units == u).item() for u in desired_units])
             len_idx.append(len(unit_idx))
@@ -495,8 +517,9 @@ class AreaLayerMatchedCellMixin(StimulusTypeMixin):
                 del loaders[readout_key]
             else:
                 dataset.transforms.insert(-1, Subsample(idx[unit_idx]))
-
-        assert (all(ele == len_idx[0] for ele in len_idx)), 'Numbers of subsampled units in each member scan are not equal'
+                
+        if key['cell_match_table'] != 'neurostatic_crossval.UnitMatching':
+            assert (all(ele == len_idx[0] for ele in len_idx)), 'Numbers of subsampled units in each member scan are not equal'
 
         return datasets, loaders
 
@@ -812,6 +835,8 @@ class DataConfig(ConfigBase, dj.Lookup):
         -> experiment.Layer
         -> anatomy.Area
         use_latest_match        : bool          # whether to use the latest matched cells (from the biggest group_id where the largest number of datasets are combined)
+        cell_match_table:       : varchar(45)   # table for cell matching 
+
         """
 
         def describe(self, key):
@@ -827,7 +852,8 @@ class DataConfig(ConfigBase, dj.Lookup):
                              [True, False],
                              ['L4', 'L2/3'],
                              ['V1', 'LM', 'RL', 'AL'],
-                             [True, False]):
+                             [True, False],
+                             ['neurodata_static_configs.MultipleDatasets', 'neurostatic_crossval.UnitMatching']):
                 yield dict(zip(self.heading.dependent_attributes, p))
                 
     class ToyCorrectedAreaLayer(dj.Part, ToyAreaLayerRawMixin):
