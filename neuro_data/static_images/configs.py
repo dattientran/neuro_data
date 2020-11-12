@@ -4,7 +4,7 @@ from attorch.dataloaders import RepeatsBatchSampler
 from torch.utils.data.sampler import SubsetRandomSampler
 
 from neuro_data.static_images.data_schemas import StaticMultiDataset
-# from neuro_data.static_images.zd_neurodata import StaticMultiDataset
+from neuro_data.static_images import zd_neurodata as zd
 
 from neuro_data.static_images.transforms import Subsample, Normalizer, ToTensor
 from neuro_data.utils.sampler import SubsetSequentialSampler, BalancedSubsetSampler
@@ -362,7 +362,10 @@ class StimulusTypeMixin:
                   exclude_from_normalization=None, stimulus_types=None, Sampler=None):
         log.info('Loading {} dataset with tier={}'.format(
             self._stimulus_type, tier))
-        datasets = StaticMultiDataset().fetch_data(key, key_order=key_order)
+        if 'subset_id' in key:
+            datasets = zd.StaticMultiDataset().fetch_data(key, key_order=key_order)
+        else:
+            datasets = StaticMultiDataset().fetch_data(key, key_order=key_order)
         for k, dat in datasets.items():
             if 'stats_source' in key:
                 log.info(

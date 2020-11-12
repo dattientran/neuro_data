@@ -42,6 +42,7 @@ shared = dj.create_virtual_module('shared', 'pipeline_shared')
 anatomy = dj.create_virtual_module('anatomy', 'pipeline_anatomy')
 treadmill = dj.create_virtual_module('treadmill', 'pipeline_treadmill')
 base = dj.create_virtual_module('neurostatic_base', 'neurostatic_base')
+imagenet = dj.create_virtual_module('pipeline_imagenet', 'pipeline_imagenet')
 
 schema = dj.schema('zhiwei_neuro_data')
 
@@ -137,6 +138,8 @@ class ImageNetSubset(dj.Lookup):
     subset_id: int 
     --- 
     description: varchar(255)
+    subset_by  : varchar(16)   # the criteria by which the subsets are divided
+    num_repeats: int          # number of repeats for each image
     """
     class TrainClass(dj.Part):
         definition = """
@@ -164,8 +167,9 @@ class ImageNetSubset(dj.Lookup):
 #             [3, 'train on "gaudy_imagenet2" and validate on "gaudy_imagenet2" and test on mixed', ['gaudy_imagenet2'], ['gaudy_imagenet2'], ['imagenet', 'gaudy_imagenet2']],
 #             [4, 'train on "gaudy_imagenet2" and validate on "imagenet" and test on mixed', ['gaudy_imagenet2'], ['imagenet'], ['imagenet', 'gaudy_imagenet2']],
 #             [5, 'train on mixed and validate on mixed and test on mixed', ['gaudy_imagenet2', 'imagenet'], ['gaudy_imagenet2', 'imagenet'], ['imagenet', 'gaudy_imagenet2']],
-#             [6, 'train on mixed and validate on "imagenet" and test on mixed', ['gaudy_imagenet2', 'imagenet'], ['imagenet'], ['imagenet', 'gaudy_imagenet2']]]
-
+#             [6, 'train on mixed and validate on "imagenet" and test on mixed', ['gaudy_imagenet2', 'imagenet'], ['imagenet'], ['imagenet', 'gaudy_imagenet2']]
+#             [7, 'train and validate on single trial responses', 'trial_number', 1]
+#             [8, 'train and validate on trial-average responses', 'trial_number', 10]]
     def fill(contents):
         for entry in contents:
             subset_id, des, train, valid, test = entry
@@ -199,6 +203,8 @@ class SubsetImageNetSplit(dj.Lookup):
                 created. Usually one where the stimulus was presented.
             subset_id: subset_id in ImageNetSubset
         """
+        subset_by, num_repeats = (ImageNetSubset & {'subset_id': subset_id}).fetch1('subset_by', 'num_repeats')
+        key = (StaticScan * ImageNetSubset & scan_key & {'subset_id': subset_id}).fetch1('KEY')
 
         # Find out whether we are using the old pipeline (grayscale only) or the new version
         if stimulus.Frame & (stimulus.Trial & scan_key):
@@ -214,59 +220,96 @@ class SubsetImageNetSplit(dj.Lookup):
         num_frames = len(unique_frames)
         assert num_frames != 0, 'unique_frames == 0'
 
-        # Separate single and oracle images
-        n = int(np.median(unique_frames.fetch('repeats')))  # HACK
-        oracle_rel = unique_frames & 'repeats > {}'.format(n)
-        single_rel = unique_frames.proj() - oracle_rel.proj()
-        num_images_per_class = int(np.floor(len(single_rel) / len(dj.U('image_class') & single_rel)))
-        # This implementation assumes there are equal numbers of images in each train_class 
+        if subset_by == 'image_class':
+            # Separate single and oracle images
+            n = int(np.median(unique_frames.fetch('repeats')))  # HACK
+            oracle_rel = unique_frames & 'repeats > {}'.format(n)
+            single_rel = unique_frames.proj() - oracle_rel.proj()
+            num_images_per_class = int(np.floor(len(single_rel) / len(dj.U('image_class') & single_rel)))
+            # This implementation assumes there are equal numbers of images in each train_class 
 
-        # Fetch key and all image classes in this subset of this scan
-        key = (StaticScan * ImageNetSubset & scan_key & {'subset_id': subset_id}).fetch1('KEY')
-        train_classes = (ImageNetSubset.TrainClass & {'subset_id': subset_id}).fetch('image_class')
-        valid_classes = (ImageNetSubset.ValidClass & {'subset_id': subset_id}).fetch('image_class')
-        test_classes = (ImageNetSubset.TestClass & {'subset_id': subset_id}).fetch('image_class')
-        self.insert1({**key, 'n_unique_images': len(oracle_rel)+num_images_per_class})
+            # Fetch key and all image classes in this subset of this scan
+            train_classes = (ImageNetSubset.TrainClass & {'subset_id': subset_id}).fetch('image_class')
+            valid_classes = (ImageNetSubset.ValidClass & {'subset_id': subset_id}).fetch('image_class')
+            test_classes = (ImageNetSubset.TestClass & {'subset_id': subset_id}).fetch('image_class')
+            self.insert1({**key, 'n_unique_images': len(oracle_rel)+num_images_per_class})
 
-        # Insert test set images (one sub test set for each image_class in test_classes in this subset)
-        for ic in test_classes:
-            test_ids = (oracle_rel & {'image_class': ic}).fetch('image_id')
-            if ic == 'imagenet':
-                self.Image.insert([{**key, 'image_id': iid, 'image_class': ic, 'tier': 'test'} for iid in test_ids])
-            else: 
-                self.Image.insert([{**key, 'image_id': iid, 'image_class': ic, 'tier': 'test_{}'.format(ic)} for iid in test_ids])
+            # Insert test set images (one sub test set for each image_class in test_classes in this subset)
+            for ic in test_classes:
+                test_ids = (oracle_rel & {'image_class': ic}).fetch('image_id')
+                if ic == 'imagenet':
+                    self.Image.insert([{**key, 'image_id': iid, 'image_class': ic, 'tier': 'test'} for iid in test_ids])
+                else: 
+                    self.Image.insert([{**key, 'image_id': iid, 'image_class': ic, 'tier': 'test_{}'.format(ic)} for iid in test_ids])
 
-        # Insert training and validation set images
-        if len(train_classes) == 1:  # Assuming if there is only one train_class, then there is also only one valid_class
-            train_ids = (single_rel & {'image_class': train_classes[0]}).fetch('image_id', order_by='repeats')
-            # * NOTE: this fetches all images first and the rest in a "random" order;
-            num_validation = int(np.ceil(len(train_ids) * 0.1))  # 10% validation examples
-            self.Image.insert([{**key, 'image_id': iid, 'image_class': valid_classes[0], 'tier': 'validation'} for iid in train_ids[:num_validation]])
-            self.Image.insert([{**key, 'image_id': iid, 'image_class': train_classes[0], 'tier': 'train'} for iid in train_ids[num_validation:]])
+            # Insert training and validation set images
+            if len(train_classes) == 1:  # Assuming if there is only one train_class, then there is also only one valid_class
+                train_ids = (single_rel & {'image_class': train_classes[0]}).fetch('image_id', order_by='repeats')
+                # * NOTE: this fetches all images first and the rest in a "random" order;
+                num_validation = int(np.ceil(len(train_ids) * 0.1))  # 10% validation examples
+                self.Image.insert([{**key, 'image_id': iid, 'image_class': valid_classes[0], 'tier': 'validation'} for iid in train_ids[:num_validation]])
+                self.Image.insert([{**key, 'image_id': iid, 'image_class': train_classes[0], 'tier': 'train'} for iid in train_ids[num_validation:]])
 
-        elif len(train_classes) > 1: # When there are multiple train_class, there can be one or multiple valid_class
-            all_selected = []
-            for i, ic in enumerate(train_classes):
-                train_ids = (single_rel & {'image_class': ic}).fetch('image_id', order_by='repeats')
-                assert len(train_ids) == num_images_per_class, 'Unequal number of images in each image class!'
+            elif len(train_classes) > 1: # When there are multiple train_class, there can be one or multiple valid_class
+                all_selected = []
+                for i, ic in enumerate(train_classes):
+                    train_ids = (single_rel & {'image_class': ic}).fetch('image_id', order_by='repeats')
+                    assert len(train_ids) == num_images_per_class, 'Unequal number of images in each image class!'
 
-                num_selected_per_class = int(np.floor(num_images_per_class / len(train_classes)))
-                # Select non-overlapping image_ids for different train_classes
-                np.random.seed(0)
-                if i == 0:
-                    selected = np.random.choice(train_ids, num_selected_per_class, replace=False).tolist()
-                else:
-                    rest = list(set(train_ids) - set(selected))
-                    selected = np.random.choice(rest, num_selected_per_class, replace=False).tolist()
-                    all_selected = all_selected + selected
-                
-                num_validation = int(np.ceil(len(selected) * 0.1))  # 10% validation examples
+                    num_selected_per_class = int(np.floor(num_images_per_class / len(train_classes)))
+                    # Select non-overlapping image_ids for different train_classes
+                    np.random.seed(0)
+                    if i == 0:
+                        selected = np.random.choice(train_ids, num_selected_per_class, replace=False).tolist()
+                    else:
+                        rest = list(set(train_ids) - set(selected))
+                        selected = np.random.choice(rest, num_selected_per_class, replace=False).tolist()
+                        all_selected = all_selected + selected
+                    
+                    num_validation = int(np.ceil(len(selected) * 0.1))  # 10% validation examples
 
-                if len(valid_classes) == 1:
-                    self.Image.insert([{**key, 'image_id': iid, 'image_class': valid_classes[0], 'tier': 'validation'} for iid in selected[:num_validation]])
-                else:  # Assumes if there are multiple valid_classes, then they are the same as train_classes (also in the same order)
-                    self.Image.insert([{**key, 'image_id': iid, 'image_class': valid_classes[i], 'tier': 'validation'} for iid in selected[:num_validation]])
-                self.Image.insert([{**key, 'image_id': iid, 'image_class': ic, 'tier': 'train'} for iid in selected[num_validation:]])
+                    if len(valid_classes) == 1:
+                        self.Image.insert([{**key, 'image_id': iid, 'image_class': valid_classes[0], 'tier': 'validation'} for iid in selected[:num_validation]])
+                    else:  # Assumes if there are multiple valid_classes, then they are the same as train_classes (also in the same order)
+                        self.Image.insert([{**key, 'image_id': iid, 'image_class': valid_classes[i], 'tier': 'validation'} for iid in selected[:num_validation]])
+                    self.Image.insert([{**key, 'image_id': iid, 'image_class': ic, 'tier': 'train'} for iid in selected[num_validation:]])
+
+        elif subset_by == 'trial_number':
+            # get oracle images
+            oracle_rel = stimulus.Trial * stimulus.Frame & scan_key & (imagenet.Album.Oracle() & 'image_class = "imagenet" and collection_id = 2')
+            unique_oracle = dj.U('image_class', 'image_id') & oracle_rel
+            test_image_classes, test_image_ids = (unique_oracle).fetch('image_class', 'image_id')
+            num_oracles = len(unique_oracle)
+
+            # split non-oracle images
+            non_oracles = unique_frames - unique_oracle
+
+            if num_repeats == 1:
+                # Compute number of validation examples
+                num_validation = int(np.ceil(len(non_oracles) * 0.1))  # 10% validation examples
+                single_image_classes, single_image_ids = (non_oracles & 'repeats = 1').fetch('image_class', 'image_id', order_by='repeats DESC')
+                repeat_image_classes, repeat_image_ids = (non_oracles & 'repeats > 1').fetch('image_class', 'image_id')
+                self.insert1({**key, 'n_unique_images': len(unique_frames)})
+                self.Image.insert([{**key, 'image_id': iid, 'image_class': ic, 'tier': 'test'} for iid, ic in
+                                        zip(test_image_ids, test_image_classes)])
+                self.Image.insert([{**key, 'image_id': iid, 'image_class': ic, 'tier': 'validation'} for iid, ic in 
+                                zip(single_image_ids[:num_validation], single_image_classes[:num_validation])])
+                self.Image.insert([{**key, 'image_id': iid, 'image_class': ic, 'tier': 'train'} for iid, ic in
+                                zip(single_image_ids[num_validation:], single_image_classes[num_validation:])])
+                self.Image.insert([{**key, 'image_id': iid, 'image_class': ic, 'tier': 'train'} for iid, ic in
+                                        zip(repeat_image_ids, repeat_image_classes)])
+            else:
+                # Compute number of validation examples
+                num_validation = int(np.ceil(len(non_oracles & 'repeats > 1') * 0.1))  # 10% validation examples
+                repeat_image_classes, repeat_image_ids = (non_oracles & 'repeats > 1').fetch('image_class', 'image_id', order_by='repeats DESC')
+                self.insert1({**key, 'n_unique_images': len(unique_frames & 'repeats > 1')})
+                self.Image.insert([{**key, 'image_id': iid, 'image_class': ic, 'tier': 'test'} for iid, ic in
+                                                    zip(test_image_ids, test_image_classes)])
+                self.Image.insert([{**key, 'image_id': iid, 'image_class': ic, 'tier': 'validation'} for iid, ic in 
+                                zip(repeat_image_ids[:num_validation], repeat_image_classes[:num_validation])])
+                self.Image.insert([{**key, 'image_id': iid, 'image_class': ic, 'tier': 'train'} for iid, ic in
+                                zip(repeat_image_ids[num_validation:], repeat_image_classes[num_validation:])])
+
 
 @schema
 class ConditionTier(dj.Computed):
@@ -434,7 +477,7 @@ class Frame(dj.Computed):
 
     @property
     def key_source(self):
-        return stimulus.Condition() * Preprocessing() #& ConditionTier()
+        return stimulus.Condition() * Preprocessing() & ConditionTier()
 
     @staticmethod
     def load_frame(key):
@@ -640,6 +683,8 @@ class InputResponse(dj.Computed, FilterMixin):
 
     def compute_data(self, key):
         key = dict((self & key).fetch1(dj.key), **key)
+        subset_by, num_repeats = (ImageNetSubset & key).fetch1('subset_by', 'num_repeats')
+
         log.info('Computing dataset for\n' + pformat(key, indent=20))
 
         # meso or reso?
@@ -657,7 +702,11 @@ class InputResponse(dj.Computed, FilterMixin):
 
         responses = (self.ResponseBlock & key).fetch1('responses')
         trials = Frame() * ConditionTier() * self.Input() * stimulus.Condition().proj('stimulus_type') & key
-        hashes, trial_idxs, tiers, types, images, row_ids = trials.fetch('condition_hash', 'trial_idx', 'tier',
+        if subset_by == 'trial_number':
+            hashes, trial_idxs, tiers, types, images, row_ids = trials.fetch('condition_hash', 'trial_idx', 'tier',
+                                                                'stimulus_type', 'frame', 'row_id', order_by='condition_hash, row_id')
+        else:
+            hashes, trial_idxs, tiers, types, images, row_ids = trials.fetch('condition_hash', 'trial_idx', 'tier',
                                                                 'stimulus_type', 'frame', 'row_id', order_by='row_id')
         images = np.stack(images)
 
@@ -766,36 +815,76 @@ class InputResponse(dj.Computed, FilterMixin):
             area=areas.astype('S')
         )
             
-        def run_stats(selector, types, ix, axis=None):
+        def run_stats(selector, types, ix, per_image=False, axis=None):
 
             ret = {}
             for t in np.unique(types):
                 if not np.any(ix & (types == t)):
                     continue
                 data = selector(ix & (types == t))
-
+                if per_image:
+                    mean = np.mean(data.mean(axis=(2,3)))
+                    std = np.mean(data.std(axis=(2, 3)))
+                else:
+                    mean = data.mean(axis=axis)
+                    std = data.std(axis=axis)
                 ret[t] = dict(
-                    mean=data.mean(axis=axis).astype(np.float32),
-                    std=data.std(axis=axis, ddof=1).astype(np.float32),
+                    mean=mean.astype(np.float32),
+                    std=std.astype(np.float32),
                     min=data.min(axis=axis).astype(np.float32),
                     max=data.max(axis=axis).astype(np.float32),
                     median=np.median(data, axis=axis).astype(np.float32)
                 )
             data = selector(ix)
             ret['all'] = dict(
-                mean=data.mean(axis=axis).astype(np.float32),
-                std=data.std(axis=axis, ddof=1).astype(np.float32),
+                mean=mean.astype(np.float32),
+                std=std.astype(np.float32),
                 min=data.min(axis=axis).astype(np.float32),
                 max=data.max(axis=axis).astype(np.float32),
                 median=np.median(data, axis=axis).astype(np.float32)
             )
             return ret
 
+        # average across trial repeats if necessary 
+        if subset_by == 'trial_number':
+            unique_image_idxs = np.array(sorted(np.unique(hashes, return_index=True)[1]))
+            images = images[unique_image_idxs]
+            types = types[unique_image_idxs]
+            hashes = hashes[unique_image_idxs]
+            tiers = tiers[unique_image_idxs]
+            trial_idxs = trial_idxs[unique_image_idxs] # only save the trial_idx of first occurance of each unique image 
+            full_row_info = row_info.copy()
+            for k in row_info:
+                row_info[k] = row_info[k][unique_image_idxs]
+
+            if num_repeats == 1:
+                responses = responses[unique_image_idxs]
+                behavior = behavior[unique_image_idxs]
+                pupil_center = pupil_center[unique_image_idxs]
+
+            if num_repeats > 1:
+                df = pd.DataFrame(full_row_info)
+                resp_df = pd.concat([df[['condition_hash']], pd.DataFrame(responses)], axis=1)
+                mean_resp_df = resp_df.groupby('condition_hash', sort=False).mean()
+                responses = mean_resp_df.to_numpy()
+
+                beh_df = pd.concat([df[['condition_hash']], pd.DataFrame(behavior)], axis=1)
+                mean_beh_df = beh_df.groupby('condition_hash', sort=False).mean()
+                behavior = mean_beh_df.to_numpy()
+
+                pupil_df = pd.concat([df[['condition_hash']], pd.DataFrame(pupil_center)], axis=1)
+                mean_pupil_df = pupil_df.groupby('condition_hash', sort=False).mean()
+                pupil_center = mean_pupil_df.to_numpy()
+                
         # --- compute statistics
         log.info('Computing statistics on training dataset')
         response_statistics = run_stats(lambda ix: responses[ix], types, tiers == 'train', axis=0)
-
-        input_statistics = run_stats(lambda ix: images[ix], types, tiers == 'train')
+        if (Preprocessing & key).fetch1('trainstats_per_image'):
+            log.info('Computing training input statistics by averaging across the values computed for individual images')
+            input_statistics = run_stats(lambda ix: images[ix], types, tiers == 'train', per_image=True)
+        else:
+            log.info('Computing training input statistics across all values of all images')
+            input_statistics = run_stats(lambda ix: images[ix], types, tiers == 'train')
 
         statistics = dict(
             images=input_statistics,
@@ -809,6 +898,7 @@ class InputResponse(dj.Computed, FilterMixin):
 
             statistics['behavior'] = behavior_statistics
             statistics['pupil_center'] = eye_statistics
+
 
         retval = dict(images=images,
                       responses=responses,
@@ -1035,7 +1125,7 @@ class StaticMultiDataset(dj.Manual):
         """
 
     @staticmethod
-    def fill():
+    def fill(subset_key):
         _template = 'group{group_id:03d}-{animal_id}-{session}-{scan_idx}-{preproc_id}-{subset_id}'
         # Check if the scan has been added to StaticMultiDataset.Member, if not then do it
         existing_scan = StaticMultiDataset.fetch('group_id')
@@ -1044,19 +1134,19 @@ class StaticMultiDataset(dj.Manual):
         except ValueError:
             gid = 1
         scan = (StaticMultiDatasetGroupAssignment & 'group_id={}'.format(gid)).fetch(as_dict=True)[0]
-        subsets = (dj.U('subset_id') & (ConditionTier & scan)).fetch(as_dict=True, order_by='subset_id')
+        subsets = (dj.U('subset_id') & (ConditionTier & scan & subset_key)).fetch(as_dict=True, order_by='subset_id')
 
         for i, s in enumerate(subsets):
-            scan['group_id'] = gid + i
+            # scan['group_id'] = gid + i
             scan = dict(scan, subset_id=s['subset_id'])
             # Check if the scan has been added to StaticMultiDataset.Member, if not then do it
-            if len(StaticMultiDataset & dict(group_id=scan['group_id'])) == 0:
+            if len(StaticMultiDataset & scan) == 0:
                 # Group id has not been added into StaticMultiDataset, thus add it
-                StaticMultiDataset.insert1(scan, ignore_extra_fields=1)
+                StaticMultiDataset.insert1(scan, ignore_extra_fields=1, skip_duplicates=True)
     
             # Handle instertion into Member table
             if len(StaticMultiDataset.Member() & scan) == 0:
-                StaticMultiDataset.Member().insert1(dict(scan, name = _template.format(**scan)), ignore_extra_fields=True)
+                StaticMultiDataset.Member().insert1(dict(scan, name = _template.format(**scan)), ignore_extra_fields=True, skip_duplicates=True)
 
     def fetch_data(self, key, key_order=None):
         assert len(self & key) == 1, 'Key must refer to exactly one multi dataset'
