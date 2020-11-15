@@ -1172,7 +1172,6 @@ from neuro_data.utils.measures import corr
 
 from .. import logger as log
 
-from staticnet_experiments import models
 from staticnet_experiments.utils import correlation_closure, compute_predictions, compute_scores
 configs = dj.create_virtual_module('neurostatic_configs', 'neurostatic_configs')
 
