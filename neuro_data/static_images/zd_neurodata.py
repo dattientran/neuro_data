@@ -1,22 +1,3 @@
-# import datajoint as dj
-# from tqdm import tqdm
-# import json
-# import numpy as np
-# import pandas as pd
-# from scipy import stats
-# import torch
-
-# from neuro_data.utils.measures import corr
-# from .configs import DataConfig
-
-# from .data_schemas import StaticMultiDataset, StaticScan
-# from . import data_schemas
-# from .. import logger as log
-
-# from staticnet_experiments import models
-# from staticnet_experiments.configs import NetworkConfig, Seed, TrainConfig
-# from staticnet_experiments.utils import correlation_closure, compute_predictions, compute_scores
-###########
 from collections import OrderedDict
 from functools import partial
 from itertools import compress
@@ -847,23 +828,20 @@ class InputResponse(dj.Computed, FilterMixin):
 
         # average across trial repeats if necessary 
         if subset_by == 'trial_number':
-            unique_image_idxs = np.array(sorted(np.unique(hashes, return_index=True)[1]))
-            images = images[unique_image_idxs]
-            types = types[unique_image_idxs]
-            hashes = hashes[unique_image_idxs]
-            tiers = tiers[unique_image_idxs]
-            trial_idxs = trial_idxs[unique_image_idxs] # only save the trial_idx of first occurance of each unique image 
-            full_row_info = row_info.copy()
-            for k in row_info:
-                row_info[k] = row_info[k][unique_image_idxs]
-
             if num_repeats == 1:
+                test_idxs = np.where(tiers == 'test')[0]
+                nontest_idxs = np.where(tiers != 'test')[0]
+                # find unique image idxs of nontest images
+                unique_nontest_idxs = nontest_idxs[np.unique(hashes[nontest_idxs], return_index=True)[1]]
+                # find idxs of unique nontest images, and all test images, then sort them by idx
+                unique_image_idxs = np.array(sorted(np.concatenate([test_idxs, unique_nontest_idxs])))
+
                 responses = responses[unique_image_idxs]
                 behavior = behavior[unique_image_idxs]
                 pupil_center = pupil_center[unique_image_idxs]
 
             if num_repeats > 1:
-                df = pd.DataFrame(full_row_info)
+                df = pd.DataFrame(row_info)
                 resp_df = pd.concat([df[['condition_hash']], pd.DataFrame(responses)], axis=1)
                 mean_resp_df = resp_df.groupby('condition_hash', sort=False).mean()
                 responses = mean_resp_df.to_numpy()
@@ -875,6 +853,16 @@ class InputResponse(dj.Computed, FilterMixin):
                 pupil_df = pd.concat([df[['condition_hash']], pd.DataFrame(pupil_center)], axis=1)
                 mean_pupil_df = pupil_df.groupby('condition_hash', sort=False).mean()
                 pupil_center = mean_pupil_df.to_numpy()
+            
+                unique_image_idxs = np.array(sorted(np.unique(hashes, return_index=True)[1]))
+
+            images = images[unique_image_idxs]
+            types = types[unique_image_idxs]
+            hashes = hashes[unique_image_idxs]
+            tiers = tiers[unique_image_idxs]
+            trial_idxs = trial_idxs[unique_image_idxs] # only save the trial_idx of first occurance of each unique image 
+            for k in row_info:
+                row_info[k] = row_info[k][unique_image_idxs]
                 
         # --- compute statistics
         log.info('Computing statistics on training dataset')
@@ -1173,6 +1161,101 @@ class StaticMultiDataset(dj.Manual):
             ])
         return ret
 
+from tqdm import tqdm
+import json
+import numpy as np
+import pandas as pd
+from scipy import stats
+import torch
+
+from neuro_data.utils.measures import corr
+
+from .. import logger as log
+
+from staticnet_experiments import models
+from staticnet_experiments.utils import correlation_closure, compute_predictions, compute_scores
+configs = dj.create_virtual_module('neurostatic_configs', 'neurostatic_configs')
+
+@schema
+class Oracle(dj.Computed):
+    definition = """
+    # oracle computation for static images
+
+    -> StaticMultiDataset.proj(dummy_subset_id='subset_id')
+    -> configs.DataConfig
+    ---
+    """
+
+    @property
+    def key_source(self):
+        return StaticMultiDataset.proj(dummy_subset_id='subset_id') * configs.DataConfig()
+
+    class Scores(dj.Part):
+        definition = """
+        -> master
+        -> StaticMultiDataset.Member.proj(dummy_subset_id='subset_id')
+        ---
+        pearson           : float     # mean pearson correlation
+        spearman          : float     # mean spearnab correlation
+        """
+
+    class UnitScores(dj.Part):
+        definition = """
+        -> master.Scores
+        -> StaticScan.Unit
+        ---
+        pearson           : float     # unit pearson correlation
+        spearman          : float     # unit spearman correlation
+        """
+
+    def make(self, key):
+        key['subset_id'] = key['dummy_subset_id']
+
+        # --- load data
+        testsets, testloaders = configs.DataConfig().load_data(key, tier='test', oracle=True)
+        self.insert1(dict(key), ignore_extra_fields=True)
+        for readout_key, loader in testloaders.items():
+            log.info('Computing oracle for ' + readout_key)
+            oracles, data = [], []
+            for inputs, *_, outputs in loader:
+                inputs = inputs.numpy()
+                outputs = outputs.numpy()
+                assert np.all(np.abs(np.diff(inputs, axis=0)) == 0), \
+                    'Images of oracle trials does not match'
+                r, n = outputs.shape  # responses X neurons
+                log.info('\t    {} responses for {} neurons'.format(r, n))
+                assert r > 4, 'need more than 4 trials for oracle computation'
+                mu = outputs.mean(axis=0, keepdims=True)
+                oracle = (mu - outputs / r) * r / (r - 1)
+                oracles.append(oracle)
+                data.append(outputs)
+            if len(data) == 0:
+                log.error('Found no oracle trials! Skipping ...')
+                return
+
+            # Pearson correlation
+            pearson = corr(np.vstack(data), np.vstack(oracles), axis=0)
+
+            # Spearman correlation
+            data_rank = np.empty(np.vstack(data).shape)
+            oracles_rank = np.empty(np.vstack(oracles).shape)
+
+            for i in range(np.vstack(data).shape[1]):
+                data_rank[:, i] = np.argsort(np.argsort(np.vstack(data)[:, i]))
+                oracles_rank[:, i] = np.argsort(np.argsort(np.vstack(oracles)[:, i]))
+            spearman = corr(data_rank, oracles_rank, axis=0)
+
+            member_key = (StaticMultiDataset.Member() & key &
+                          dict(name=readout_key)).fetch1(dj.key)
+            member_key = dict(member_key, **key)
+            self.Scores().insert1(dict(member_key, pearson=np.mean(pearson), spearman=np.mean(spearman)), ignore_extra_fields=True)
+            unit_ids = testsets[readout_key].neurons.unit_ids
+            assert len(unit_ids) == len(
+                pearson) == len(spearman) == outputs.shape[-1], 'Neuron numbers do not add up'
+            self.UnitScores().insert(
+                [dict(member_key, pearson=c, spearman=s, unit_id=u)
+                 for u, c, s in tqdm(zip(unit_ids, pearson, spearman), total=len(unit_ids))],
+                ignore_extra_fields=True)
 
 ########################
 # @schema
@@ -1295,7 +1378,7 @@ class StaticMultiDataset(dj.Manual):
 
 # def oracle_score(key, tier):
 #     # --- load data
-#     testsets, testloaders = DataConfig().load_data(key=key, tier=tier, oracle=True)
+#     testsets, testloaders = configs.DataConfig().load_data(key=key, tier=tier, oracle=True)
     
 #     for readout_key, loader in testloaders.items():
 #         log.info('Computing oracle for ' + readout_key)
@@ -1334,13 +1417,13 @@ class StaticMultiDataset(dj.Manual):
 #     # oracle computation for static images
 
 #     -> StaticMultiDataset
-#     -> DataConfig
+#     -> configs.DataConfig
 #     ---
 #     """
 
 #     @property
 #     def key_source(self):
-#         return StaticMultiDataset() * DataConfig()
+#         return StaticMultiDataset() * configs.DataConfig()
 
 #     class Scores(dj.Part):
 #         definition = """
@@ -1383,13 +1466,13 @@ class StaticMultiDataset(dj.Manual):
 #     # oracle computation for static images
 
 #     -> StaticMultiDataset
-#     -> DataConfig
+#     -> configs.DataConfig
 #     ---
 #     """
 
 #     @property
 #     def key_source(self):
-#         return StaticMultiDataset() * DataConfig()
+#         return StaticMultiDataset() * configs.DataConfig()
 
 #     class Scores(dj.Part):
 #         definition = """
@@ -1417,7 +1500,7 @@ class StaticMultiDataset(dj.Manual):
 
 #     def make(self, key):
 #         # --- load data
-#         testsets, testloaders = DataConfig().load_data(key, tier='test', oracle=True)
+#         testsets, testloaders = configs.DataConfig().load_data(key, tier='test', oracle=True)
 
 #         self.insert1(dict(key))
 #         for readout_key, loader in testloaders.items():
@@ -1546,7 +1629,7 @@ class StaticMultiDataset(dj.Manual):
 #     def load_network(self, key=None, trainsets=None):
 #         if key is None:
 #             key = self.fetch1(dj.key)
-#         model = NetworkConfig().build_network(key, trainsets=trainsets)
+#         model = configs.NetworkConfig().build_network(key, trainsets=trainsets)
 #         state_dict = (models.Model & key).fetch1('model')
 #         state_dict = {k: torch.as_tensor(state_dict[k][0].copy()) for k in state_dict.dtype.names}
 #         mod_state_dict = model.state_dict()
@@ -1566,11 +1649,11 @@ class StaticMultiDataset(dj.Manual):
 #         model.cuda()
 
 #         # get network configuration information
-#         net_key = NetworkConfig().net_key(key)
-#         train_key = TrainConfig().train_key(net_key)
+#         net_key = configs.NetworkConfig().net_key(key)
+#         train_key = configs.TrainConfig().train_key(net_key)
         
 #         def compute_test_corr(net_key, tier, train_key):
-#             testsets, testloaders = DataConfig().load_data(net_key, tier=tier, cuda=True, **train_key)
+#             testsets, testloaders = configs.DataConfig().load_data(net_key, tier=tier, cuda=True, **train_key)
 
 #             scores, unit_scores = [], []
 #             for readout_key, testloader in testloaders.items():
