@@ -95,6 +95,106 @@ class Oracle(dj.Computed):
                 [dict(member_key, pearson=c, spearman=s, unit_id=u)
                  for u, c, s in tqdm(zip(unit_ids, pearson, spearman), total=len(unit_ids))],
                 ignore_extra_fields=True)
+            
+@schema
+class OracleMultiTier(dj.Computed):
+    definition = """
+    # oracle computation for static images using multiple tiers per scan
+
+    -> StaticMultiDataset
+    -> DataConfig
+    ---
+    """
+
+    @property
+    def key_source(self):
+        return StaticMultiDataset() * DataConfig()
+
+    class Scores(dj.Part):
+        definition = """
+        -> master
+        -> StaticMultiDataset.Member
+        ---
+        pearson           : float     # mean pearson correlation
+        spearman          : float     # mean spearnab correlation
+        """
+
+    class UnitScores(dj.Part):
+        definition = """
+        -> master.Scores
+        -> StaticScan.Unit
+        ---
+        pearson           : float     # unit pearson correlation
+        spearman          : float     # unit spearman correlation
+        """
+
+    def make(self, key):
+        self.insert1(dict(key))
+
+        tiers = (dj.U('tier') & (data_schemas.ConditionTier & (StaticMultiDataset.Member & key)) & 'tier LIKE "test%%"').fetch('tier')
+        
+        # --- load data
+        dsets, dloaders = [], []
+        for tier in tiers:
+            testsets, testloaders = DataConfig().load_data(key, tier=tier, oracle=True)
+            dsets.append(testsets)
+            dloaders.append(testloaders)
+
+        for (readout_key, loader1), (_, loader2) in zip(dloaders[0].items(), dloaders[1].items()):
+            log.info('Computing oracle for ' + readout_key)
+            oracles, data = [], []
+            for inputs, *_, outputs in loader1:
+                inputs = inputs.numpy()
+                outputs = outputs.numpy()
+                assert np.all(np.abs(np.diff(inputs, axis=0)) == 0), \
+                    'Images of oracle trials does not match'
+                r, n = outputs.shape  # responses X neurons
+                log.info('\t    {} responses for {} neurons'.format(r, n))
+                assert r > 4, 'need more than 4 trials for oracle computation'
+                mu = outputs.mean(axis=0, keepdims=True)
+                oracle = (mu - outputs / r) * r / (r - 1)
+                oracles.append(oracle)
+                data.append(outputs)
+
+            for inputs, *_, outputs in loader2:
+                inputs = inputs.numpy()
+                outputs = outputs.numpy()
+                assert np.all(np.abs(np.diff(inputs, axis=0)) == 0), \
+                    'Images of oracle trials does not match'
+                r, n = outputs.shape  # responses X neurons
+                log.info('\t    {} responses for {} neurons'.format(r, n))
+                assert r > 4, 'need more than 4 trials for oracle computation'
+                mu = outputs.mean(axis=0, keepdims=True)
+                oracle = (mu - outputs / r) * r / (r - 1)
+                oracles.append(oracle)
+                data.append(outputs)
+            if len(data) == 0:
+                log.error('Found no oracle trials! Skipping ...')
+                return
+
+            # Pearson correlation
+            pearson = corr(np.vstack(data), np.vstack(oracles), axis=0)
+
+            # Spearman correlation
+            data_rank = np.empty(np.vstack(data).shape)
+            oracles_rank = np.empty(np.vstack(oracles).shape)
+
+            for i in range(np.vstack(data).shape[1]):
+                data_rank[:, i] = np.argsort(np.argsort(np.vstack(data)[:, i]))
+                oracles_rank[:, i] = np.argsort(np.argsort(np.vstack(oracles)[:, i]))
+            spearman = corr(data_rank, oracles_rank, axis=0)
+
+            member_key = (StaticMultiDataset.Member() & key &
+                          dict(name=readout_key)).fetch1(dj.key)
+            member_key = dict(member_key, **key)
+            self.Scores().insert1(dict(member_key, pearson=np.mean(pearson), spearman=np.mean(spearman)), ignore_extra_fields=True)
+            unit_ids = testsets[readout_key].neurons.unit_ids
+            assert len(unit_ids) == len(
+                pearson) == len(spearman) == outputs.shape[-1], 'Neuron numbers do not add up'
+            self.UnitScores().insert(
+                [dict(member_key, pearson=c, spearman=s, unit_id=u)
+                 for u, c, s in tqdm(zip(unit_ids, pearson, spearman), total=len(unit_ids))],
+                ignore_extra_fields=True)
 
 
 def load_dataset(key):
