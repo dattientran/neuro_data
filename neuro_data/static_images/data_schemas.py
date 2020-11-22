@@ -35,7 +35,7 @@ UNIQUE_FRAME = {
 }
 
 IMAGE_CLASSES = 'image_class in ("imagenet", "masked_oracle", "masked_single", "diverse_mei", "searched_nat", "mei2", "imagenet_v2_gray", "imagenet_v2_rgb", "gaudy_imagenet2", "exciting_imagenet")' # all valid natural image classes
-ORACLE_CLASSES = 'image_class in ("imagenet", "masked_oracle", "gaudy_imagenet2", "exciting_imagenet")'
+ORACLE_CLASSES = 'image_class in ("imagenet", "masked_oracle", "gaudy_imagenet2", "exciting_imagenet", "mei2")'
 TRAINING_CLASSES = 'image_class in ("imagenet", "masked_single", "searched_nat", "diverse_mei", "mei2", "gaudy_imagenet2")'
 MASKED_CLASSES = ['diverse_mei', 'mei2', 'masked_single']
 FF_CLASSES = ['imagenet', 'searched_nat', 'gaudy_imagenet2', 'exciting_imagenet']
@@ -99,7 +99,7 @@ class Tier(dj.Lookup):
 
     @property
     def contents(self):
-        yield from zip(["train", "test", "test_masked", "test_exciting", "validation"])
+        yield from zip(["train", "validation", "test", "test_masked", "test_exciting", 'test_ff', 'test_mei'])
 
 
 @schema
@@ -229,20 +229,58 @@ class TempImageNetSplit(dj.Lookup):
         assert len(unique_frames) != 0, 'unique_frames == 0'
 
         n = int(np.median(unique_frames.fetch('repeats')))  # HACK
-        num_oracles = len(unique_frames & 'repeats > {}'.format(n))  # repeats
+        oracle_rel = unique_frames & 'repeats > {}'.format(n)
+        num_oracles = len(oracle_rel) 
         if num_oracles == 0:
             raise ValueError('Could not find repeated frames to use for oracle.')
+            
+        if len(dj.U('image_class') & unique_frames) == 1 or len(dj.U('image_class') & unique_frames) == 2 and len(dj.U('image_class') & oracle_rel) == 1:
+            # Compute number of validation examples
+            num_validation = int(np.ceil((num_frames - num_oracles) * 0.1))  # 10% validation examples
+
+            # Fetch images in specific image classes
+            image_ids, image_classes = (unique_frames & IMAGE_CLASSES).fetch('image_id', 'image_class', order_by='repeats DESC')
+            # * NOTE: this fetches all oracle images first and the rest in a "random" order;
+            # we use that random order to make the validation/training division below.
+
+            self.Image.insert([{**key, 'image_id': iid, 'image_class': ic, 'tier': 'test'} for iid, ic in
+                         zip(image_ids[:num_oracles], image_classes[:num_oracles])], skip_duplicates=True)
+            self.Image.insert([{**key, 'image_id': iid, 'image_class': ic, 'tier': 'validation'} for iid, ic in 
+                               zip(image_ids[num_oracles: num_oracles + num_validation], image_classes[num_oracles: num_oracles + num_validation])])
+            self.Image.insert([{**key, 'image_id': iid, 'image_class': ic, 'tier': 'train'} for iid, ic in
+                             zip(image_ids[num_oracles + num_validation:], image_classes[num_oracles + num_validation:])])
         
-        if len(dj.U('image_class') & unique_frames) <= 2: # fewer than two image classes, this is a bit of hack, not ideal
+        elif len(dj.U('image_class') & unique_frames) == 2: # fewer than two image classes, this is a bit of hack, not ideal
             # Compute number of validation examples
             num_validation = int(np.ceil((num_frames - num_oracles) * 0.1))  # 10% validation examples
 
             # Fetch images in specific image classes
 #             masked_oracle_ids, masked_oracle_classes = (unique_frames & 'image_class = "masked_oracle"').fetch('image_id', 'image_class', order_by='repeats DESC')
-            exciting_oracle_ids, exciting_oracle_classes = (unique_frames & 'image_class = "exciting_imagenet"').fetch('image_id', 'image_class', order_by='repeats DESC')
-
-            image_ids, image_classes = (unique_frames & IMAGE_CLASSES & 'image_class = "imagenet"').fetch('image_id', 'image_class', order_by='repeats DESC')
-
+            mei_image_ids, mei_image_classes = (unique_frames & 'image_class = "mei2"').fetch('image_id', 'image_class', order_by='repeats DESC')
+            nat_image_ids, nat_image_classes = (unique_frames & 'image_class = "imagenet"').fetch('image_id', 'image_class', order_by='repeats DESC')
+            
+            if len(mei_image_ids) > 0 and len(nat_image_ids) > 0:
+                num_oracles = int(num_oracles / 2)
+            if len(mei_image_ids) > len(nat_image_ids):
+                image_ids = mei_image_ids
+                image_classes = mei_image_classes
+                self.Image.insert([{**key, 'image_id': iid, 'image_class': ic, 'tier': 'test_ff'} for iid, ic in
+                         zip(nat_image_ids, nat_image_classes)], skip_duplicates=True)
+            else:
+                image_ids = nat_image_ids
+                image_classes = nat_image_classes
+                self.Image.insert([{**key, 'image_id': iid, 'image_class': ic, 'tier': 'test_mei'} for iid, ic in
+                         zip(mei_image_ids, mei_image_classes)], skip_duplicates=True)
+                
+            self.Image.insert([{**key, 'image_id': iid, 'image_class': ic, 'tier': 'test'} for iid, ic in
+                         zip(image_ids[:num_oracles], image_classes[:num_oracles])], skip_duplicates=True)
+            self.Image.insert([{**key, 'image_id': iid, 'image_class': ic, 'tier': 'validation'} for
+                             iid, ic in zip(image_ids[num_oracles: num_oracles + num_validation],
+                                            image_classes[num_oracles: num_oracles + num_validation])])
+            self.Image.insert([{**key, 'image_id': iid, 'image_class': ic, 'tier': 'train'} for iid, ic in
+                             zip(image_ids[num_oracles + num_validation:],
+                                 image_classes[num_oracles + num_validation:])])
+                
             # * NOTE: this fetches all oracle images first and the rest in a "random" order;
             # we use that random order to make the validation/training division below.
 
@@ -253,19 +291,20 @@ class TempImageNetSplit(dj.Lookup):
 #                 self.Image.insert([{**key, 'image_id': iid, 'image_class': ic, 'tier': 'test_masked'} for iid, ic in
 #                          zip(masked_oracle_ids, masked_oracle_classes)], skip_duplicates=True)
                 
-            if len(exciting_oracle_ids) > 0:
-                # Get number of full-field oracles
-                num_oracles = int(num_oracles / 2)
-                self.Image.insert([{**key, 'image_id': iid, 'image_class': ic, 'tier': 'test_exciting'} for iid, ic in
-                         zip(exciting_oracle_ids, exciting_oracle_classes)], skip_duplicates=True)
-            self.Image.insert([{**key, 'image_id': iid, 'image_class': ic, 'tier': 'test'} for iid, ic in
-                         zip(image_ids[:num_oracles], image_classes[:num_oracles])], skip_duplicates=True)
-            self.Image.insert([{**key, 'image_id': iid, 'image_class': ic, 'tier': 'validation'} for
-                         iid, ic in zip(image_ids[num_oracles: num_oracles + num_validation],
-                                        image_classes[num_oracles: num_oracles + num_validation])])
-            self.Image.insert([{**key, 'image_id': iid, 'image_class': ic, 'tier': 'train'} for iid, ic in
-                         zip(image_ids[num_oracles + num_validation:],
-                             image_classes[num_oracles + num_validation:])])
+#             if len(other_oracle_ids) > 0:
+#                 # Get number of full-field oracles
+#                 num_oracles = int(num_oracles / 2)
+#                 self.Image.insert([{**key, 'image_id': iid, 'image_class': ic, 'tier': 'test'} for iid, ic in
+#                          zip(exciting_oracle_ids, exciting_oracle_classes)], skip_duplicates=True)
+                
+#             self.Image.insert([{**key, 'image_id': iid, 'image_class': ic, 'tier': 'test'} for iid, ic in
+#                          zip(image_ids[:num_oracles], image_classes[:num_oracles])], skip_duplicates=True)
+#             self.Image.insert([{**key, 'image_id': iid, 'image_class': ic, 'tier': 'validation'} for
+#                          iid, ic in zip(image_ids[num_oracles: num_oracles + num_validation],
+#                                         image_classes[num_oracles: num_oracles + num_validation])])
+#             self.Image.insert([{**key, 'image_id': iid, 'image_class': ic, 'tier': 'train'} for iid, ic in
+#                          zip(image_ids[num_oracles + num_validation:],
+#                              image_classes[num_oracles + num_validation:])])
         
         else: # when there are more than two image classes
             train_rels = (dj.U('image_class') & unique_frames & TRAINING_CLASSES).fetch()
@@ -429,10 +468,14 @@ class Preprocessing(dj.Lookup):
         {'preproc_id': 2, 'offset': 0.05, 'duration': 0.5, 'row': 72, 'col': 128,
          'filter': 'hamming', 'gamma': False},
         {'preproc_id': 3, 'offset': 0.05, 'duration': 0.5, 'row': 36, 'col': 64,
-         'filter': 'hamming', 'gamma': True},
+         'filter': 'hamming', 'gamma': True},        
+        {'preproc_id': 5, 'offset': 0.05, 'duration': 0.5, 'row': 36, 'col': 64,
+         'filter': 'hamming', 'gamma': True, 'trainstats_per_image': 1, 'linear_mon': 0}, 
+        {'preproc_id': 6, 'offset': 0.05, 'duration': 0.5, 'row': 36, 'col': 64,
+         'filter': 'hamming', 'gamma': True, 'trainstats_per_image': 1, 'linear_mon': 1}, 
     ]
 
-
+        
 def process_frame(preproc_key, frame):
     """
     Helper function that preprocesses a frame
@@ -711,8 +754,55 @@ class InputResponse(dj.Computed, FilterMixin):
         hashes = hashes.astype(str)
         types = types.astype(str)
         
+        # gamma correction
+        if (Preprocessing & key).fetch1('gamma'):
+#             log.info('Gamma correcting images.')
+#             from staticnet_analyses import multi_mei
+
+#             if len(multi_mei.ClosestCalibration & key) == 0:
+#                 raise ValueError('No ClosestMonitorCalibration for this scan.')
+#             f, f_inv = (multi_mei.ClosestCalibration & key).get_fs()
+
+            from scipy.optimize import curve_fit
+            from scipy import interpolate
+            def func(x, a, b, m):
+                return a + b * (x**m)
+
+            def get_gamma_function(moncalib_key, pdcalib_key):
+                # get the median pd values from the monitor calibration scan
+                pixel_values, mean_pd, median_pd = (experiment.MonitorCalibration & moncalib_key).fetch1('pixel_value', 'pd_mean', 'pd_median')
+
+                # get the most recent pd calibration trial
+                pixels, lums, pds = (experiment.PhotodiodeCalibration() & pdcalib_key).fetch('pixel_value', 'luminance', 'pd_voltage', order_by='pixel_value')
+
+                # fit a function of pd voltages and luminance 
+                pd2lum_popt, _ = curve_fit(func, pds, lums)
+
+                # fit a function of pixel values and the luminance
+                px2lum_popt, _ = curve_fit(func, pixel_values, func(median_pd, *pd2lum_popt))
+                px2lum_interp = interpolate.interp1d(pixel_values, func(median_pd, *pd2lum_popt))
+                inv_px2lum_interp = interpolate.interp1d(func(median_pd, *pd2lum_popt), pixel_values)
+
+                return pixel_values, px2lum_popt, px2lum_interp, inv_px2lum_interp
+
+            moncalib_on_key = dict(animal_id=24620, session=4, scan_idx=18)
+            pdcalib_on_key = dict(rig="2p4", trial=8)
+            _, _, f, f_inv = get_gamma_function(moncalib_on_key, pdcalib_on_key)
+            
+            images = f(images)
+
+        # get actual displayed pixels when monitor is linearized
+        if (Preprocessing & key).fetch1('linear_mon'):
+            lum_min = 0.01787
+            lum_max = 10.2795
+            lum_values = np.linspace(lum_min, lum_max, 256)
+            lut = np.power((lum_values + 0.09643) /0.00027224, 1/1.905)
+            from scipy import interpolate
+            lin_f = interpolate.interp1d(np.linspace(0, 255, 256), lut, kind='cubic')
+            images = lin_f(images)
+            
         # Compute training set mean and std (now only implemented when the only one unique type is stimulus.Frame)
-        def compute_train_stats(trials):
+        def compute_train_stats(key, trials):
             train_cond_rel = stimulus.Frame * trials & 'tier = "train"'
             train_classes = (dj.U('image_class') & train_cond_rel).fetch('image_class')
 
@@ -737,8 +827,57 @@ class InputResponse(dj.Computed, FilterMixin):
                     masks = [np.ones(frames[0].shape)] * len(frames)
                 train_masks.append(np.stack(masks))
                 train_frames.append(np.stack(frames))
+                
             train_masks = np.vstack(train_masks)
             train_frames = np.vstack(train_frames)
+            
+            # gamma correction
+            if (Preprocessing & key).fetch1('gamma'):
+                log.info('Gamma correcting images.')
+#                 from staticnet_analyses import multi_mei
+
+#                 if len(multi_mei.ClosestCalibration & key) == 0:
+#                     raise ValueError('No ClosestMonitorCalibration for this scan.')
+#                 f, f_inv = (multi_mei.ClosestCalibration & key).get_fs()
+
+                from scipy.optimize import curve_fit
+                from scipy import interpolate
+                def func(x, a, b, m):
+                    return a + b * (x**m)
+
+                def get_gamma_function(moncalib_key, pdcalib_key):
+                    # get the median pd values from the monitor calibration scan
+                    pixel_values, mean_pd, median_pd = (experiment.MonitorCalibration & moncalib_key).fetch1('pixel_value', 'pd_mean', 'pd_median')
+
+                    # get the most recent pd calibration trial
+                    pixels, lums, pds = (experiment.PhotodiodeCalibration() & pdcalib_key).fetch('pixel_value', 'luminance', 'pd_voltage', order_by='pixel_value')
+
+                    # fit a function of pd voltages and luminance 
+                    pd2lum_popt, _ = curve_fit(func, pds, lums)
+
+                    # fit a function of pixel values and the luminance
+                    px2lum_popt, _ = curve_fit(func, pixel_values, func(median_pd, *pd2lum_popt))
+                    px2lum_interp = interpolate.interp1d(pixel_values, func(median_pd, *pd2lum_popt))
+                    inv_px2lum_interp = interpolate.interp1d(func(median_pd, *pd2lum_popt), pixel_values)
+
+                    return pixel_values, px2lum_popt, px2lum_interp, inv_px2lum_interp
+
+                moncalib_on_key = dict(animal_id=24620, session=4, scan_idx=18)
+                pdcalib_on_key = dict(rig="2p4", trial=8)
+                _, _, f, f_inv = get_gamma_function(moncalib_on_key, pdcalib_on_key)
+            
+
+                train_frames = f(train_frames)
+
+            # get actual displayed pixels when monitor is linearized
+            if (Preprocessing & key).fetch1('linear_mon'):
+                lum_min = 0.01787
+                lum_max = 10.2795
+                lum_values = np.linspace(lum_min, lum_max, 256)
+                lut = np.power((lum_values + 0.09643) /0.00027224, 1/1.905)
+                from scipy import interpolate
+                lin_f = interpolate.interp1d(np.linspace(0, 255, 256), lut, kind='cubic')
+                train_frames = lin_f(train_frames)
 
             # Not sure if this is ideal: compute mean and std of within the mask for each image, and then average across images
             im_mean = []
@@ -751,19 +890,7 @@ class InputResponse(dj.Computed, FilterMixin):
             train_std = np.mean(im_std).astype(np.float32)
 
             return train_mean, train_std
-        
-        train_mean, train_std = compute_train_stats(trials)
-
-        # gamma correction
-        if (Preprocessing & key).fetch1('gamma'):
-            log.info('Gamma correcting images.')
-            from staticnet_analyses import multi_mei
-
-            if len(multi_mei.ClosestCalibration & key) == 0:
-                raise ValueError('No ClosestMonitorCalibration for this scan.')
-            f, f_inv = (multi_mei.ClosestCalibration & key).get_fs()
-            images = f(images)
-
+        train_mean, train_std = compute_train_stats(key, trials)
 
         # --- extract infomation for each trial
         extra_info = pd.DataFrame({'condition_hash':hashes, 'trial_idx':trial_idxs})
@@ -924,8 +1051,12 @@ class InputResponse(dj.Computed, FilterMixin):
         # --- compute statistics
         log.info('Computing statistics on training dataset')
         response_statistics = run_stats(lambda ix: responses[ix], types, tiers == 'train', axis=0)
-
-        input_statistics = run_stats(lambda ix: images[ix], types, tiers == 'train')
+        if (Preprocessing & key).fetch1('trainstats_per_image'):
+            log.info('Computing training input statistics by averaging across the values computed for individual images')
+            input_statistics = run_input_stats(lambda ix: images[ix], types, tiers == 'train')
+        else:
+            log.info('Computing training input statistics across all values of all images')
+            input_statistics = run_stats(lambda ix: images[ix], types, tiers == 'train')
 
         statistics = dict(
             images=input_statistics,
