@@ -9,7 +9,7 @@ import pandas as pd
 
 from neuro_data import logger as log
 from neuro_data.utils.data import h5cached, SplineCurve, FilterMixin, fill_nans, NaNSpline
-from neuro_data.static_images import datasets
+from neuro_data.static_images import datasets, configs as neuro_configs
 
 dj.config['external-data'] = {'protocol': 'file', 'location': '/external/'}
 
@@ -24,6 +24,7 @@ anatomy = dj.create_virtual_module('anatomy', 'pipeline_anatomy')
 treadmill = dj.create_virtual_module('treadmill', 'pipeline_treadmill')
 base = dj.create_virtual_module('neurostatic_base', 'neurostatic_base')
 imagenet = dj.create_virtual_module('pipeline_imagenet', 'pipeline_imagenet')
+loop = dj.create_virtual_module('neurostatic_zhiwei_loop', 'neurostatic_zhiwei_loop')
 
 schema = dj.schema('zhiwei_neuro_data')
 
@@ -727,7 +728,7 @@ class InputResponse(dj.Computed, FilterMixin):
         on = ['animal_id', 'condition_hash', 'scan_idx', 'session', 'trial_idx']
         for t, df in dfs.items():
             mapping = {c:(t.lower() + '_' + c) for c in set(df.columns) - set(on)}
-            dfs[t] = df.rename(str, mapping)
+            dfs[t] = df.rename(columns=mapping)
         df = list(dfs.values())[0]
         for d in list(dfs.values())[1:]:
             df = df.merge(d, how='outer', on=on)
@@ -1115,25 +1116,29 @@ class StaticMultiDataset(dj.Manual):
     @staticmethod
     def fill(subset_key):
         _template = 'group{group_id:03d}-{animal_id}-{session}-{scan_idx}-{preproc_id}-{subset_id}'
-        # Check if the scan has been added to StaticMultiDataset.Member, if not then do it
-        existing_scan = StaticMultiDataset.fetch('group_id')
-        try:
-            gid = np.max(existing_scan) + 1
-        except ValueError:
-            gid = 1
-        scan = (StaticMultiDatasetGroupAssignment & 'group_id={}'.format(gid)).fetch(as_dict=True)[0]
-        subsets = (dj.U('subset_id') & (ConditionTier & scan & subset_key)).fetch(as_dict=True, order_by='subset_id')
+        if not len(StaticMultiDataset & {'group_id': subset_key['group_id']}) > 0:
+            existing_scan = StaticMultiDataset.fetch('group_id')
+            try:
+                gid = np.max(existing_scan) + 1
+            except ValueError:
+                gid = 1
+        else:
+            gid = subset_key['group_id']
 
-        for i, s in enumerate(subsets):
-            # scan['group_id'] = gid + i
-            scan = dict(scan, subset_id=s['subset_id'])
-            # Check if the scan has been added to StaticMultiDataset.Member, if not then do it
-            if len(StaticMultiDataset & scan) == 0:
-                # Group id has not been added into StaticMultiDataset, thus add it
-                StaticMultiDataset.insert1(scan, ignore_extra_fields=1, skip_duplicates=True)
-    
-            # Handle instertion into Member table
-            if len(StaticMultiDataset.Member() & scan) == 0:
+        scans = (StaticMultiDatasetGroupAssignment & 'group_id={}'.format(gid)).fetch(as_dict=True)
+        for scan in scans:
+            subsets = (dj.U('subset_id') & (ConditionTier & scan & subset_key)).fetch(as_dict=True, order_by='subset_id')
+
+            for i, s in enumerate(subsets):
+                # scan['group_id'] = gid + i
+                scan = dict(scan, subset_id=s['subset_id'])
+                # Check if the scan has been added to StaticMultiDataset.Member, if not then do it
+                if len(StaticMultiDataset & scan) == 0:
+                    # Group id has not been added into StaticMultiDataset, thus add it
+                    StaticMultiDataset.insert1(scan, ignore_extra_fields=1, skip_duplicates=True)
+        
+                # Handle instertion into Member table
+                # if len(StaticMultiDataset.Member() & scan) == 0:
                 StaticMultiDataset.Member().insert1(dict(scan, name = _template.format(**scan)), ignore_extra_fields=True, skip_duplicates=True)
 
     def fetch_data(self, key, key_order=None):
@@ -1160,6 +1165,113 @@ class StaticMultiDataset(dj.Manual):
                 (k, ret[k]) for k in key_order
             ])
         return ret
+
+
+@schema
+class MultipleDatasets(dj.Computed):
+    definition = """
+    -> StaticMultiDataset
+    -> neuro_configs.CellMatchParameters
+    -> loop.LoopGroup
+    """
+    
+    @property
+    def key_source(self):
+        return loop.LoopGroup * StaticMultiDataset * neuro_configs.CellMatchParameters  # need to restrict by loop_group, group_id, match_params
+   
+    class MatchedCells(dj.Part):
+        definition = """ # Matched cells (in the same order) in each member scan of the multi dataset
+        -> master
+        -> StaticMultiDataset.Member
+        ---
+        name:            varchar(50)   # string description of the member scan to be used for training
+        matched_cells:   longblob      # array of matched cells in each member scan of the group, unit_ids at the same indices for each member scan represent the matched cells
+        """
+    
+    def make(self, key):
+        match_params = (neuro_configs.CellMatchParameters & key).fetch1()
+        
+        keys, d1, d2, corr_matrix = (loop.PairScanCellMatchOracleCorr & key).fetch('KEY', 'src_units', 'target_units', 'corr_matrix')
+        keep = []
+        all_diags = []
+        all_target_keys = []
+        all_target_units = []
+
+        for k, d1_units, d2_units, corr in zip(keys, d1, d2, corr_matrix):
+            diag = np.diag(corr)
+            d1_key = (StaticMultiDataset.Member & key & {'animal_id': k['animal_id'], 'session': k['src_session'], 'scan_idx': k['src_scan_idx'], 'loop_group': k['loop_group']}).fetch1()
+            d2_key = (StaticMultiDataset.Member & key & {'animal_id': k['animal_id'], 'session': k['target_session'], 'scan_idx': k['target_scan_idx'], 'loop_group': k['loop_group']}).fetch1()
+
+            # Compute mean distance between matched cells
+            if (loop.ClosedLoopScan & d1_key).fetch1('mei_source'): # when src key is has mei_source=1 (day 1 scan)
+                src_key = d1_key.copy()
+                src_units = d1_units.copy()
+                all_target_keys.append(d2_key)
+                all_target_units.append(d2_units)
+                all_diags.append(diag)
+                src_rest = InputResponse.ResponseKeys.proj(src_session='session', src_scan_idx='scan_idx', src_unit_id='unit_id')
+                distance = (loop.TempBestProximityCellMatch2 & src_rest & d2_key & {'src_session': d1_key['session'], 'src_scan_idx': d1_key['scan_idx']}).fetch('mean_distance', order_by='src_unit_id')
+
+            else: # when src key is has mei_source!=1 (a scan after day 1)
+                distance = []
+                for d1_u, d2_u in zip(d1_units, d2_units):
+                    d1x, d1y, d1z = (meso.StackCoordinates.UnitInfo() & d1_key & 'segmentation_method = 6' & {'unit_id': d1_u}).fetch('stack_x', 'stack_y', 'stack_z', order_by=('stack_session', 'stack_idx'))
+                    d2x, d2y, d2z = (meso.StackCoordinates.UnitInfo() & d2_key & 'segmentation_method = 6' & {'unit_id': d2_u}).fetch('stack_x', 'stack_y', 'stack_z', order_by=('stack_session', 'stack_idx'))
+                    dist = []
+                    for x1, y1, z1, x2, y2, z2 in zip(d1x, d1y, d1z, d2x, d2y, d2z):
+                        dist.append(np.sqrt((x1-x2)**2 + (y1-y2)**2 + (z1-z2)**2))
+                    distance.append(np.mean(dist))
+
+            # Select matched pairs that satisfy thresholds on oracle correlation and max distance 
+            oraclecorr_thre = match_params['oraclecorr_thre']
+            distance_thre = match_params['distance_thre']
+            keep.append((diag > oraclecorr_thre) & (np.array(distance) < distance_thre))
+
+        # Select satisfied matched pairs across all pairs of datasets
+        all_keep = keep[0]
+        for i in range(len(keep)):
+            all_keep *= keep[i]
+
+        # # OLD METHOD
+        # old_keep_src_units = src_units[all_keep]
+        # old_keep_target_units = all_target_units[0][all_keep]
+
+        # # Iteratively take the most correlated pairs for units matched to the same target unit
+        # final_src_units = []
+        # final_target_units = []
+        # for src, target, corr in sorted(zip(old_keep_src_units, old_keep_target_units, diag[all_keep]), key=lambda x: x[-1], reverse=True):
+        #     if target not in final_target_units:
+        #         final_src_units.append(src)
+        #         final_target_units.append(target)
+
+        # CURRENT METHOD
+        current_keep_src_units = src_units[all_keep]
+        current_keep_target_units = np.stack(all_target_units)[:, all_keep]
+        all_diags = np.stack(all_diags)[:, all_keep] # BUG: for group 188-193, forgot to add this line, so some of selected unique src_units are not the ones with highest correlation with the target_units
+
+        # Keep only one unique unit in each dataset
+        if match_params['unique_match_per_pair']:
+            all_keep_idx = []
+            for units, corrs in zip(current_keep_target_units, all_diags): # for each target dataset
+                keep_units, keep_idx = [], []
+                for (i, u), corr in sorted(zip(enumerate(units), corrs), key=lambda x: x[-1], reverse=True): # iteratively select the idx with highest correlation to keep
+                    if u not in keep_units:
+                        keep_units.append(u)
+                        keep_idx.append(i)
+                all_keep_idx.append(keep_idx)
+            final_keep_idx = list(set.intersection(*map(set, all_keep_idx)))
+
+            keep_src_units = current_keep_src_units[final_keep_idx]
+            keep_target_units = current_keep_target_units[:, final_keep_idx]
+            
+            for units in keep_target_units:
+                assert len(units) == len(np.unique(units)), 'Matched units not unique in target datasets!'
+
+        self.insert1(key)
+        self.MatchedCells.insert1({**key, **src_key, 'matched_cells': keep_src_units})
+        for target_key, target_units in zip(all_target_keys, keep_target_units):
+            self.MatchedCells.insert1({**key, **target_key, 'matched_cells': target_units})
+
 
 from tqdm import tqdm
 import json

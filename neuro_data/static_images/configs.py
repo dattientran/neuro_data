@@ -474,6 +474,14 @@ class AreaLayerMatchedCellMixin(StimulusTypeMixin):
                                               exclude_from_normalization=exclude,
                                               stimulus_types=stimulus_types,
                                               Sampler=Sampler)
+        if 'subset_id' in key:
+            dset_table = zd.StaticMultiDataset
+            cell_match_table = zd.MultipleDatasets
+        else:
+            dset_table = StaticMultiDataset
+            cell_match_table = MultipleDatasets
+
+        
         len_idx = []
         for readout_key, dataset in datasets.items():
             
@@ -496,20 +504,20 @@ class AreaLayerMatchedCellMixin(StimulusTypeMixin):
             
             if key['cell_match_table'] == 'neurodata_static_configs.MultipleDatasets':
                 if key['use_latest_match']: # when only use matched cells from the last group of a combined dataset (as a control to compare model performance)
-                    animal, session, scan = (StaticMultiDataset.Member & {'name': readout_key}).fetch1('animal_id', 'session', 'scan_idx')
-                    desired_units = (MultipleDatasets.MatchedCells & {'animal_id': animal, 'session': session, 'scan_idx': scan}).fetch('matched_cells', order_by='group_id')[-1]
+                    animal, session, scan = (dset_table.Member & {'name': readout_key}).fetch1('animal_id', 'session', 'scan_idx')
+                    desired_units = (cell_match_table.MatchedCells & {'animal_id': animal, 'session': session, 'scan_idx': scan}).fetch('matched_cells', order_by='group_id')[-1]
                 else:
-                    if len(MultipleDatasets.MatchedCells() & {'name': readout_key}) > 0:    # when combining datasets
-                        desired_units = (MultipleDatasets.MatchedCells() & {'name': readout_key}).fetch1('matched_cells')
+                    if len(cell_match_table.MatchedCells() & {'name': readout_key}) > 0:    # when combining datasets
+                        desired_units = (cell_match_table.MatchedCells() & {'name': readout_key}).fetch1('matched_cells')
                     else:    # hack: when only use matched cells from one dataset (as a control to compare model performance)
-                        animal, session, scan = (StaticMultiDataset.Member & key).fetch1('animal_id', 'session', 'scan_idx')
-                        desired_units = (MultipleDatasets.MatchedCells & {'animal_id': animal, 'session': session, 'scan_idx': scan}).fetch1('matched_cells')
+                        animal, session, scan = (dset_table.Member & key).fetch1('animal_id', 'session', 'scan_idx')
+                        desired_units = (cell_match_table.MatchedCells & {'animal_id': animal, 'session': session, 'scan_idx': scan}).fetch1('matched_cells')
                         
             elif key['cell_match_table'] == 'neurostatic_crossval.UnitMatching':
-                animal, session, scan = (StaticMultiDataset.Member & {'name': readout_key}).fetch1('animal_id', 'session', 'scan_idx')
-                num_groups = len(StaticMultiDataset.Member & key)
+                animal, session, scan = (dset_table.Member & {'name': readout_key}).fetch1('animal_id', 'session', 'scan_idx')
+                num_groups = len(dset_table.Member & key)
                 shared_rel = dj.U("match_id").aggr(dj.U("group_id", "match_id").aggr(crossval.UnitMatching.Match & "match_params = {}".format(1), c="COUNT(*)"), num_groups='COUNT(c)') & {'num_groups': num_groups}
-                desired_units, match_ids, = (crossval.UnitMatching.Match * StaticMultiDataset.Member() & 'match_params = 1' & shared_rel.proj() & {'animal_id': animal, 'session': session, 'scan_idx': scan}).fetch('unit_id', 'match_id', order_by='unit_id')
+                desired_units, match_ids, = (crossval.UnitMatching.Match * dset_table.Member() & 'match_params = 1' & shared_rel.proj() & {'animal_id': animal, 'session': session, 'scan_idx': scan}).fetch('unit_id', 'match_id', order_by='unit_id')
                 
             unit_idx = np.array([np.argwhere(units == u).item() for u in desired_units])
             len_idx.append(len(unit_idx))
