@@ -511,7 +511,7 @@ class AreaLayerMatchedCellMixin(StimulusTypeMixin):
                         desired_units = (cell_match_table.MatchedCells() & {'name': readout_key}).fetch1('matched_cells')
                     else:    # hack: when only use matched cells from one dataset (as a control to compare model performance)
                         animal, session, scan = (dset_table.Member & key).fetch1('animal_id', 'session', 'scan_idx')
-                        desired_units = (cell_match_table.MatchedCells & {'animal_id': animal, 'session': session, 'scan_idx': scan}).fetch1('matched_cells')
+                        desired_units = (cell_match_table.MatchedCells & {'animal_id': animal, 'session': session, 'scan_idx': scan}).fetch('matched_cells')[0]
                         
             elif key['cell_match_table'] == 'neurostatic_crossval.UnitMatching':
                 animal, session, scan = (dset_table.Member & {'name': readout_key}).fetch1('animal_id', 'session', 'scan_idx')
@@ -847,7 +847,6 @@ class DataConfig(ConfigBase, dj.Lookup):
         -> anatomy.Area
         use_latest_match        : bool          # whether to use the latest matched cells (from the biggest group_id where the largest number of datasets are combined)
         cell_match_table:       : varchar(45)   # table for cell matching 
-
         """
 
         def describe(self, key):
