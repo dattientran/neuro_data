@@ -364,6 +364,8 @@ class StimulusTypeMixin:
             self._stimulus_type, tier))
         if 'subset_id' in key:
             datasets = zd.StaticMultiDataset().fetch_data(key, key_order=key_order)
+        elif len(zd.StaticMultiDataset2 & key) > 0:
+            datasets = zd.StaticMultiDataset2().fetch_data(key, key_order=key_order)
         else:
             datasets = StaticMultiDataset().fetch_data(key, key_order=key_order)
         for k, dat in datasets.items():
@@ -477,6 +479,9 @@ class AreaLayerMatchedCellMixin(StimulusTypeMixin):
         if 'subset_id' in key:
             dset_table = zd.StaticMultiDataset
             cell_match_table = zd.MultipleDatasets
+        elif len(zd.StaticMultiDataset2 & key) > 0:
+            dset_table = zd.StaticMultiDataset2
+            cell_match_table = zd.MultipleDatasets2
         else:
             dset_table = StaticMultiDataset
             cell_match_table = MultipleDatasets
