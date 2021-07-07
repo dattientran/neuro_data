@@ -1,6 +1,6 @@
 import numpy as np
 
-def corr(y1,y2, axis=-1, eps=1e-8, **kwargs):
+def corr(y1,y2, axis=-1, eps=1e-18, **kwargs):
     """
     Compute the correlation between two matrices along certain dimensions. 
 
